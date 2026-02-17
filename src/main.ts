@@ -1,377 +1,255 @@
 import { Devvit, Context, RedditAPIClient } from '@devvit/public-api';
 
 /**
- * Banned Users List (Auto-updated) — FULL CODE
+ * Banned List Poster — "Simple but Full‑Featured"
  *
- * ✅ Up to 1000 banned users (config: banListLimit)
- * ✅ Ban reason pulled from Modlog (type=banuser) + optional mod-note fallback
- * ✅ Mapping rules configurable via JSON
- * ✅ Output configurable:
- *    - showCategory (optional)
- *    - showReason (optional)
- *    - table or bullets
- * ✅ Scheduler safe (won’t create duplicate cron actions)
- * ✅ Manual mod action to PURGE old cron jobs + reschedule (best-effort)
+ * ✅ Uses ONLY /about/banned listing via ctx.reddit.getBannedUsers (no modlog, no modnotes)
+ * ✅ Extracts NOTE + REASON defensively (supports u.data nesting + multiple key aliases)
+ * ✅ Mapping -> short labels (configurable JSON)
+ * ✅ Exclusions (configurable):
+ *    - excludeIfTextContains (needle match across raw note+reason)
+ *    - excludeIfMappedLabelIn (label match after mapping)
  *
- * ✅ NEW FIX (requested):
- * applyMappingToReasonPrefix + reasonPrefixOnlyIfMapped
- *  - If applyMappingToReasonPrefix=true:
- *      - reasonPrefixOnlyIfMapped=true  => only replace prefix when mapping matched; else keep original reason
- *      - reasonPrefixOnlyIfMapped=false => always replace prefix (unmatched becomes defaultLabel prefix)
+ * ✅ Full mod tooling UX retained:
+ *    - Update active post (safe)
+ *    - Create NEW post (set active)
+ *    - Create NEW post (do NOT set active)
+ *    - Refresh schedule (only if needed)
+ *    - PURGE old crons + reschedule (best effort)
+ *
+ * ✅ Scheduler:
+ *    - New job name + legacy job name supported (avoids "Job not found")
+ *    - Stored jobId + cron in KV to avoid cron limits
+ *
+ * ✅ Install/Upgrade:
+ *    - Best-effort schedule only, never fails installation
  */
 
-const JOB_NAME = 'update_banned_list_post';
+const JOB_NAME_NEW = 'simple_banned_list_update';
+const JOB_NAME_LEGACY = 'update_banned_list_post'; // absorb old scheduled jobs safely
 
-const KV_POST_PREFIX = 'banned_list_post:';
-const KV_DEBUG_PREFIX = 'banned_list_debug:';
-const KV_CRON_PREFIX = 'banned_list_cron:';
-const KV_JOBID_PREFIX = 'banned_list_jobid:';
+// KV keys
+const KV_POST_PREFIX = 'banlist_post:';     // active post ref
+const KV_CRON_PREFIX = 'banlist_cron:';     // stored cron string
+const KV_JOBID_PREFIX = 'banlist_jobid:';   // stored scheduler jobId
+const KV_DEBUG_PREFIX = 'banlist_debug:';   // debug snapshot
+
+type MappingRule = { label: string; keywords: string[] };
+
+type OutputSort = 'note_asc' | 'user_asc';
+
+type Config = {
+  postTitle: string;
+  postIdKey: string;
+
+  scheduleEnabled: boolean;
+  scheduleCron: string;
+
+  banListLimit: number;
+  maxRowsInPost: number;
+
+  // Exclusions
+  excludeIfTextContains: string[];   // needles, lowercase
+  excludeIfMappedLabelIn: string[];  // labels, lowercase
+
+  // Mapping
+  mappingRules: MappingRule[];
+  defaultLabel: string;
+
+  // Formatting
+  maskUsernamesInNote: boolean;
+  sortBy: OutputSort;
+
+  // Behavior
+  createNewOnEditFail: boolean;
+  setNewPostAsActive: boolean;
+
+  // Debug
+  debugVerbose: boolean;
+};
 
 type StoredPostRef = { postId: string; updatedAt: string; idKey: string };
-type MappingRule = { label: string; keywords: string[] };
-type FallbackBehavior = 'do_nothing' | 'create_new';
-type ReasonSource = 'modlog_banuser' | 'mod_note' | 'modlog_then_modnote';
-type Actor = 'cron' | 'manual_update' | 'manual_create' | 'install_or_upgrade' | 'schedule_action';
-type OutputMode = 'table' | 'bullets';
 
-type Row = { user: string; category: string; reason: string };
+type BannedListingRow = {
+  name: string;   // username, no "u/"
+  note: string;   // NOTE column
+  reason: string; // REASON column
+  raw: string;    // note||reason
+};
 
-type DebugReport = {
+type RunMode = 'update_existing_only' | 'create_new_and_set_active' | 'create_new_no_change_active';
+
+type DebugSnapshot = {
   ts: string;
   subreddit: string;
   idKey: string;
-  actor: Actor;
-
-  settings: Record<string, any>;
-
-  bannedUsers: { count: number; sample: string[] };
-
-  modlog: {
-    fetched: number;
-    mapped: number;
-    missing: number;
-    sampleEntryKeys: string[];
-    sampleTargetKeys: string[];
-  };
-
-  modNotes: { attempts: number; failures: number };
-
-  rows: {
-    finalCount: number;
-    excludedCount: number;
-    truncated: boolean;
-    sample: Array<{ user: string; category: string; reason: string }>;
-  };
-
-  post: {
-    kvPostKey: string;
-    storedPostId?: string | null;
-
-    fetchOk?: boolean;
-    archivedRaw?: any;
-    archivedParsed?: boolean;
-    lockedRaw?: any;
-    lockedParsed?: boolean;
-
-    canEdit?: boolean;
-    notEditableReason?: string | null;
-
-    mode: 'update_existing_only' | 'create_new_and_set_active' | 'create_new_no_change_active';
-    fallbackChosen?: FallbackBehavior;
-
-    editAttempted?: boolean;
-    editSucceeded?: boolean;
-    editError?: string;
-
-    createAttempted?: boolean;
-    createSucceeded?: boolean;
-    createdPostId?: string;
-
-    didSetNewActive?: boolean;
-    finalActivePostId?: string | null;
-
-    skipped?: boolean;
-    skippedReason?: string;
-  };
-
-  scheduler: {
-    kvCronKey: string;
-    kvJobIdKey: string;
-    prevCron?: string | null;
-    prevJobId?: string | null;
-
-    cancelAttempted: boolean;
-    cancelSucceeded?: boolean;
-
-    scheduleAttempted: boolean;
-    scheduleSucceeded?: boolean;
-    scheduleJobId?: string;
-    scheduleError?: string;
-
-    purgeAttempted?: boolean;
-    purgeCanceledJobIds?: string[];
-
-    note: string[];
-  };
-
-  notes: string[];
+  actor: 'cron' | 'manual' | 'install_or_upgrade' | 'schedule_action';
+  cfg: Record<string, any>;
+  bans: { total: number; sample: any[]; sampleKeys: string[]; sampleDataKeys: string[] };
+  rows: { out: number; excludedByText: number; excludedByLabel: number; sample: Array<{ u: string; raw: string; label: string }> };
+  post: { storedPostId?: string | null; action: string; finalPostId?: string | null; error?: string };
+  scheduler: { note: string[]; prevCron?: string | null; prevJobId?: string | null; newJobId?: string | null; error?: string | null };
 };
 
 // -------------------- Settings --------------------
 Devvit.addSettings([
-  // Title
   { type: 'string', name: 'postTitle', label: 'Post title', defaultValue: 'Banned Users List (Auto-updated)' },
+  { type: 'string', name: 'postIdKey', label: 'Post key (tracks which post to update)', defaultValue: 'banned-users-list' },
 
-  // Schedule
   { type: 'boolean', name: 'scheduleEnabled', label: 'Enable auto-update schedule', defaultValue: true },
-  { type: 'string', name: 'scheduleCron', label: 'Auto-update cron (UNIX cron)', defaultValue: '*/2 * * * *' },
+  { type: 'string', name: 'scheduleCron', label: 'Auto-update cron (UNIX cron)', defaultValue: '*/30 * * * *' },
 
-  // Fallback policy when active post is NOT editable
-  {
-    type: 'string',
-    name: 'fallbackOnUneditable_cron',
-    label: 'CRON fallback when active post uneditable: "do_nothing" | "create_new"',
-    defaultValue: 'do_nothing',
-  },
-  {
-    type: 'string',
-    name: 'fallbackOnUneditable_manualUpdate',
-    label: 'MANUAL UPDATE fallback when active post uneditable: "do_nothing" | "create_new"',
-    defaultValue: 'create_new',
-  },
-  {
-    type: 'boolean',
-    name: 'setNewPostAsActive',
-    label: 'When creating a new post via fallback, set it as active',
-    defaultValue: true,
-  },
+  { type: 'number', name: 'banListLimit', label: 'Max banned users to list (up to 1000)', defaultValue: 1000 },
+  { type: 'number', name: 'maxRowsInPost', label: 'Max rows in post (avoid size limits)', defaultValue: 1000 },
 
-  // Reason source
-  {
-    type: 'string',
-    name: 'reasonSource',
-    label: 'Reason source: "modlog_banuser" | "mod_note" | "modlog_then_modnote"',
-    defaultValue: 'modlog_banuser',
-  },
+  // Exclusion controls (fully configurable)
+  { type: 'string', name: 'excludeIfTextContains', label: 'Exclude if text contains (comma-separated, case-insensitive)', defaultValue: 'usl ban:,usl ban from,usl ban' },
+  { type: 'string', name: 'excludeIfMappedLabelIn', label: 'Exclude if mapped label is (comma-separated, case-insensitive)', defaultValue: 'USL Ban' },
 
-  // Mapping
+  // Mapping rules (JSON)
   {
     type: 'string',
     name: 'mappingJson',
-    label: 'Mapping rules (JSON) — maps keywords to a label',
+    label: 'Mapping rules JSON (maps note/reason text to short labels)',
     defaultValue: JSON.stringify(
       [
-        { label: 'Scamming', keywords: ['scam', 'scamming', 'scammer', 'fraud', 'no scamming'] },
-        { label: 'Selling accounts/services', keywords: ['selling', 'sell', 'account', 'service', 'pilot', 'boost'] },
-        { label: 'Harassment/Discrimination', keywords: ['harass', 'bully', 'slur', 'racist', 'homophobic', 'transphobic', 'sexist'] },
+        { label: 'Ban Evasion', keywords: ['ban evasion'] },
+        { label: 'Harassment, Bullying or Discrimination', keywords: ['behaviour', 'no harassment', 'harassment', 'bully', 'discrimination', 'dox', 'doxx', 'doxxing', 'slur', 'racist', 'homophobic', 'transphobic', 'sexist', 'nude', 'nudes'] },
+        { label: 'Scamming', keywords: ['scamming', 'scam', 'scammer', '#scammer', 'fraud'] },
+        { label: 'Selling of accounts, Pokémon, or services', keywords: ['selling', 'buying', 'advertising', 'service', 'services', 'coins', 'raid service', 'pilot', 'boost'] },
+        { label: 'Threatening, harassing, or inciting violence', keywords: ['threat', 'threatening', 'inciting violence', 'violence'] },
+        { label: 'Spamming', keywords: ['spam', 'no spam', 'posting frequency', 'off-topic', 'advert'] },
+
+        // Optional: map USL explicitly so label-exclusion can hide it cleanly
+        { label: 'USL Ban', keywords: ['usl ban'] },
       ],
       null,
       2
     ),
   },
+  { type: 'string', name: 'defaultLabel', label: 'Default label if no mapping match / empty', defaultValue: 'No reason provided' },
 
-  // Defaults / Output
-  { type: 'string', name: 'defaultLabel', label: 'Default category label (when no mapping match)', defaultValue: 'Banned' },
-  { type: 'string', name: 'postIdKey', label: 'Post key (tracks which post to update)', defaultValue: 'banned-users-list' },
+  // Formatting
+  { type: 'boolean', name: 'maskUsernamesInNote', label: 'Mask usernames inside note (u/******)', defaultValue: true },
+  { type: 'string', name: 'sortBy', label: 'Sort: "note_asc" or "user_asc"', defaultValue: 'note_asc' },
 
-  { type: 'boolean', name: 'showCategory', label: 'Show category column', defaultValue: false },
-  { type: 'boolean', name: 'showReason', label: 'Show ban reason/rule column', defaultValue: true },
-  { type: 'string', name: 'outputMode', label: 'Output mode: "table" or "bullets"', defaultValue: 'table' },
-
-  // Mapping affects displayed reason prefix too
-  {
-    type: 'boolean',
-    name: 'applyMappingToReasonPrefix',
-    label: 'Apply mapping label to the reason prefix (e.g. "Scamming: permanent" -> "Scamming Brother: permanent")',
-    defaultValue: false,
-  },
-
-  // ✅ NEW: only rewrite reason prefix if mapping matched
-  {
-    type: 'boolean',
-    name: 'reasonPrefixOnlyIfMapped',
-    label: 'If mapping reason prefix, only replace prefix when mapping matched; else keep original reason',
-    defaultValue: true,
-  },
-
-  { type: 'string', name: 'sortOrder', label: 'Sort: "username_asc" | "username_desc"', defaultValue: 'username_asc' },
-
-  // Filters
-  { type: 'string', name: 'excludeIfReasonContains', label: 'Exclude if reason contains (case-insensitive, comma-separated)', defaultValue: 'usl ban:' },
-
-  // ModNotes fallback
-  { type: 'number', name: 'modNotesPerUser', label: 'How many mod notes to fetch per user (1 is fastest)', defaultValue: 1 },
-
-  // Modlog scanning
-  { type: 'number', name: 'modlogLookbackLimit', label: 'How many modlog entries to scan (banuser)', defaultValue: 5000 },
-
-  // Ban list size
-  { type: 'number', name: 'banListLimit', label: 'Max banned users to list (up to 1000)', defaultValue: 1000 },
-
-  // Post size control
-  { type: 'number', name: 'maxRowsInPost', label: 'Max rows to include in the post (avoid size limits)', defaultValue: 1000 },
+  // Behavior
+  { type: 'boolean', name: 'createNewOnEditFail', label: 'If editing active post fails, create a new post', defaultValue: true },
+  { type: 'boolean', name: 'setNewPostAsActive', label: 'When creating a new post, set it as active', defaultValue: true },
 
   // Debug
   { type: 'boolean', name: 'debugVerbose', label: 'Verbose logs', defaultValue: true },
 ]);
 
-// -------------------- Config --------------------
-type SettingsConfig = {
-  title: string;
-  idKey: string;
-
-  scheduleEnabled: boolean;
-  scheduleCron: string;
-
-  fallbackCron: FallbackBehavior;
-  fallbackManualUpdate: FallbackBehavior;
-  setNewPostAsActive: boolean;
-
-  reasonSource: ReasonSource;
-
-  defaultLabel: string;
-  showCategory: boolean;
-  showReason: boolean;
-  outputMode: OutputMode;
-
-  applyMappingToReasonPrefix: boolean;
-  reasonPrefixOnlyIfMapped: boolean;
-
-  sort: 'username_asc' | 'username_desc';
-
-  mappingRules: MappingRule[];
-  mappingParseError?: string;
-
-  excludeNeedles: string[];
-  modNotesPerUser: number;
-
-  modlogLookbackLimit: number;
-  banListLimit: number;
-  maxRowsInPost: number;
-
-  debugVerbose: boolean;
-};
-
-function normalizeFallback(v: string, def: FallbackBehavior): FallbackBehavior {
-  const s = (v ?? '').trim().toLowerCase();
-  if (s === 'create_new') return 'create_new';
-  if (s === 'do_nothing') return 'do_nothing';
-  return def;
+// -------------------- Helpers: parsing --------------------
+function userToPlain(u: any): any {
+  if (!u) return u;
+  try {
+    if (typeof u.toJSON === 'function') return u.toJSON();
+  } catch {}
+  const out: any = {};
+  const fields = [
+    'id','username','createdAt','linkKarma','commentKarma','nsfw','isAdmin','modPermissions',
+    'url','permalink','hasVerifiedEmail','displayName','about'
+  ];
+  for (const f of fields) {
+    try { out[f] = (u as any)[f]; } catch {}
+  }
+  // Include any enumerable own props too
+  try {
+    for (const k of Object.keys(u)) out[k] = (u as any)[k];
+  } catch {}
+  return out;
 }
 
-function normalizeReasonSource(v: string): ReasonSource {
-  const s = (v ?? '').trim().toLowerCase();
-  if (s === 'mod_note') return 'mod_note';
-  if (s === 'modlog_then_modnote') return 'modlog_then_modnote';
-  return 'modlog_banuser';
+function parseCsvLower(v: string): string[] {
+  return String(v ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 }
 
-function normalizeOutputMode(v: string): OutputMode {
-  const s = (v ?? '').trim().toLowerCase();
-  return s === 'bullets' ? 'bullets' : 'table';
-}
-
-function safeParseMappings(raw: string): { rules: MappingRule[]; error?: string } {
+function safeParseMappings(raw: string): MappingRule[] {
   try {
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return { rules: [], error: 'mappingJson must be a JSON array.' };
-
-    const rules = parsed
+    if (!Array.isArray(parsed)) return [];
+    return parsed
       .map((r: any) => ({
         label: String(r?.label ?? '').trim(),
-        keywords: Array.isArray(r?.keywords) ? r.keywords.map((k: any) => String(k).toLowerCase().trim()).filter(Boolean) : [],
+        keywords: Array.isArray(r?.keywords)
+          ? r.keywords.map((k: any) => String(k ?? '').toLowerCase().trim()).filter(Boolean)
+          : [],
       }))
       .filter((r: MappingRule) => r.label.length > 0 && r.keywords.length > 0);
-
-    return { rules };
-  } catch (e: any) {
-    return { rules: [], error: `Invalid mappingJson: ${e?.message ?? 'parse error'}` };
+  } catch {
+    return [];
   }
 }
 
-async function getCfg(ctx: Context): Promise<SettingsConfig> {
-  const title = String((await ctx.settings.get('postTitle')) ?? 'Banned Users List (Auto-updated)');
-  const idKey = String((await ctx.settings.get('postIdKey')) ?? 'banned-users-list');
+async function getCfg(ctx: Context): Promise<Config> {
+  const postTitle = String((await ctx.settings.get('postTitle')) ?? 'Banned Users List (Auto-updated)');
+  const postIdKey = String((await ctx.settings.get('postIdKey')) ?? 'banned-users-list');
 
   const scheduleEnabled = Boolean(await ctx.settings.get('scheduleEnabled'));
-  const scheduleCron = String((await ctx.settings.get('scheduleCron')) ?? '*/2 * * * *');
-
-  const fbCronRaw = String((await ctx.settings.get('fallbackOnUneditable_cron')) ?? 'do_nothing');
-  const fbManualRaw = String((await ctx.settings.get('fallbackOnUneditable_manualUpdate')) ?? 'create_new');
-  const fallbackCron = normalizeFallback(fbCronRaw, 'do_nothing');
-  const fallbackManualUpdate = normalizeFallback(fbManualRaw, 'create_new');
-
-  const setNewPostAsActive = Boolean(await ctx.settings.get('setNewPostAsActive'));
-
-  const reasonSourceRaw = String((await ctx.settings.get('reasonSource')) ?? 'modlog_banuser');
-  const reasonSource = normalizeReasonSource(reasonSourceRaw);
-
-  const defaultLabel = String((await ctx.settings.get('defaultLabel')) ?? 'Banned');
-  const showCategory = Boolean(await ctx.settings.get('showCategory'));
-  const showReason = Boolean(await ctx.settings.get('showReason'));
-  const outputMode = normalizeOutputMode(String((await ctx.settings.get('outputMode')) ?? 'table'));
-
-  const applyMappingToReasonPrefix = Boolean(await ctx.settings.get('applyMappingToReasonPrefix'));
-  const reasonPrefixOnlyIfMapped = Boolean(await ctx.settings.get('reasonPrefixOnlyIfMapped'));
-
-  const sortRaw = String((await ctx.settings.get('sortOrder')) ?? 'username_asc');
-  const sort: 'username_asc' | 'username_desc' = sortRaw === 'username_desc' ? 'username_desc' : 'username_asc';
-
-  const mappingJson = String((await ctx.settings.get('mappingJson')) ?? '[]');
-  const parsed = safeParseMappings(mappingJson);
-
-  const excludeRaw = String((await ctx.settings.get('excludeIfReasonContains')) ?? '');
-  const excludeNeedles = excludeRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-
-  const modNotesPerUser = Math.max(1, Number((await ctx.settings.get('modNotesPerUser')) ?? 1) || 1);
-  const modlogLookbackLimit = Math.max(50, Number((await ctx.settings.get('modlogLookbackLimit')) ?? 5000) || 5000);
+  const scheduleCron = String((await ctx.settings.get('scheduleCron')) ?? '*/30 * * * *');
 
   const banListLimit = Math.min(1000, Math.max(1, Number((await ctx.settings.get('banListLimit')) ?? 1000) || 1000));
   const maxRowsInPost = Math.min(2000, Math.max(1, Number((await ctx.settings.get('maxRowsInPost')) ?? 1000) || 1000));
 
+  const excludeIfTextContains = parseCsvLower(String((await ctx.settings.get('excludeIfTextContains')) ?? ''));
+  const excludeIfMappedLabelIn = parseCsvLower(String((await ctx.settings.get('excludeIfMappedLabelIn')) ?? ''));
+
+  const mappingJson = String((await ctx.settings.get('mappingJson')) ?? '[]');
+  const mappingRules = safeParseMappings(mappingJson);
+
+  const defaultLabel = String((await ctx.settings.get('defaultLabel')) ?? 'No reason provided').trim() || 'No reason provided';
+
+  const maskUsernamesInNote = Boolean(await ctx.settings.get('maskUsernamesInNote'));
+  const sortByRaw = String((await ctx.settings.get('sortBy')) ?? 'note_asc').trim().toLowerCase();
+  const sortBy: OutputSort = sortByRaw === 'user_asc' ? 'user_asc' : 'note_asc';
+
+  const createNewOnEditFail = Boolean(await ctx.settings.get('createNewOnEditFail'));
+  const setNewPostAsActive = Boolean(await ctx.settings.get('setNewPostAsActive'));
+
   const debugVerbose = Boolean(await ctx.settings.get('debugVerbose'));
 
   return {
-    title,
-    idKey,
+    postTitle,
+    postIdKey,
     scheduleEnabled,
     scheduleCron,
-    fallbackCron,
-    fallbackManualUpdate,
-    setNewPostAsActive,
-    reasonSource,
-    defaultLabel,
-    showCategory,
-    showReason,
-    outputMode,
-    applyMappingToReasonPrefix,
-    reasonPrefixOnlyIfMapped,
-    sort,
-    mappingRules: parsed.rules,
-    mappingParseError: parsed.error,
-    excludeNeedles,
-    modNotesPerUser,
-    modlogLookbackLimit,
     banListLimit,
     maxRowsInPost,
+    excludeIfTextContains,
+    excludeIfMappedLabelIn,
+    mappingRules,
+    defaultLabel,
+    maskUsernamesInNote,
+    sortBy,
+    createNewOnEditFail,
+    setNewPostAsActive,
     debugVerbose,
   };
 }
 
-function decideFallback(cfg: SettingsConfig, actor: Actor): FallbackBehavior {
-  if (actor === 'cron') return cfg.fallbackCron;
-  if (actor === 'manual_update') return cfg.fallbackManualUpdate;
-  return 'do_nothing';
+// -------------------- Helpers: KV keys --------------------
+function kvPostKey(sub: string, idKey: string): string {
+  return `${KV_POST_PREFIX}${sub}:${idKey}`;
+}
+function kvCronKey(sub: string, idKey: string): string {
+  return `${KV_CRON_PREFIX}${sub}:${idKey}`;
+}
+function kvJobIdKey(sub: string, idKey: string): string {
+  return `${KV_JOBID_PREFIX}${sub}:${idKey}`;
+}
+function kvDebugKey(sub: string, idKey: string): string {
+  return `${KV_DEBUG_PREFIX}${sub}:${idKey}`;
 }
 
-// -------------------- KV keys/helpers --------------------
-const kvPostKey = (sub: string, idKey: string) => `${KV_POST_PREFIX}${sub}:${idKey}`;
-const kvDebugKey = (sub: string, idKey: string) => `${KV_DEBUG_PREFIX}${sub}:${idKey}`;
-const kvCronKey = (sub: string, idKey: string) => `${KV_CRON_PREFIX}${sub}:${idKey}`;
-const kvJobIdKey = (sub: string, idKey: string) => `${KV_JOBID_PREFIX}${sub}:${idKey}`;
-
+// -------------------- Helpers: KV read/write --------------------
 async function readStoredPostRef(ctx: Context, idKey: string): Promise<StoredPostRef | null> {
-  const raw = await ctx.kvStore.get(kvPostKey(ctx.subredditName!, idKey));
+  const sub = ctx.subredditName!;
+  const raw = await ctx.kvStore.get(kvPostKey(sub, idKey));
   if (!raw) return null;
   try {
     return JSON.parse(raw) as StoredPostRef;
@@ -381,25 +259,225 @@ async function readStoredPostRef(ctx: Context, idKey: string): Promise<StoredPos
 }
 
 async function writeStoredPostRef(ctx: Context, idKey: string, postId: string): Promise<void> {
+  const sub = ctx.subredditName!;
   const value: StoredPostRef = { postId, updatedAt: new Date().toISOString(), idKey };
-  await ctx.kvStore.put(kvPostKey(ctx.subredditName!, idKey), JSON.stringify(value));
+  await ctx.kvStore.put(kvPostKey(sub, idKey), JSON.stringify(value));
 }
 
-async function writeDebug(ctx: Context, idKey: string, report: DebugReport): Promise<void> {
-  await ctx.kvStore.put(kvDebugKey(ctx.subredditName!, idKey), JSON.stringify(report, null, 2));
-}
-
-async function readDebug(ctx: Context, idKey: string): Promise<DebugReport | null> {
-  const raw = await ctx.kvStore.get(kvDebugKey(ctx.subredditName!, idKey));
-  if (!raw) return null;
+async function writeDebug(ctx: Context, idKey: string, snap: DebugSnapshot): Promise<void> {
+  const sub = ctx.subredditName!;
   try {
-    return JSON.parse(raw) as DebugReport;
+    await ctx.kvStore.put(kvDebugKey(sub, idKey), JSON.stringify(snap, null, 2));
+  } catch {
+    // ignore
+  }
+}
+
+async function readDebug(ctx: Context, idKey: string): Promise<DebugSnapshot | null> {
+  const sub = ctx.subredditName!;
+  try {
+    const raw = await ctx.kvStore.get(kvDebugKey(sub, idKey));
+    if (!raw) return null;
+    return JSON.parse(raw) as DebugSnapshot;
   } catch {
     return null;
   }
 }
 
-// -------------------- Post editability checks --------------------
+// -------------------- Mapping + formatting --------------------
+function maskUsernamesInsideNote(noteRaw: string): string {
+  return String(noteRaw ?? '').replace(/u\/\S+/g, 'u/******');
+}
+
+function mapTextToLabel(text: string, rules: MappingRule[], defaultLabel: string): { label: string; matched: boolean } {
+  const t = String(text ?? '').toLowerCase();
+  for (const rule of rules) {
+    if (rule.keywords.some((kw) => kw && t.includes(kw))) return { label: rule.label, matched: true };
+  }
+  return { label: defaultLabel, matched: false };
+}
+
+function escapeMd(s: string): string {
+  return String(s ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\|/g, '\\|')
+    .trim();
+}
+
+function buildMarkdown(sub: string, title: string, rows: Array<{ name: string; note: string }>, maxRows: number): string {
+  const updated = new Date().toISOString();
+  const header =
+    `# ${escapeMd(title)}\n\n` +
+    `**Subreddit:** r/${escapeMd(sub)}\n` +
+    `**Last updated:** ${escapeMd(updated)}\n\n`;
+
+  if (!rows.length) return `${header}_No banned users found (or missing permissions)._`;
+
+  const MAX_BODY_CHARS = 39000;
+  let out = header + `| Name | Note |\n|------|------|\n`;
+
+  let added = 0;
+  let truncated = false;
+
+  for (const r of rows.slice(0, maxRows)) {
+    const line = `| u/${escapeMd(r.name)} | ${escapeMd(r.note)} |\n`;
+    if (out.length + line.length + 200 > MAX_BODY_CHARS) {
+      truncated = true;
+      break;
+    }
+    out += line;
+    added++;
+  }
+
+  if (truncated) out += `\n_⚠️ Truncated to ${added} rows due to Reddit post size limits._\n`;
+  return out;
+}
+
+
+function logBanUserDebug(u: any, idx: number, extracted: { name: string; note: string; reason: string; raw: string }, mapping: { label: string; matched: boolean }, excluded: { byText: boolean; byLabel: boolean }, cfg: { maskUsernamesInNote: boolean }): void {
+  const topKeys = Object.keys(u ?? {});
+  const dataKeys = Object.keys((u?.data ?? {}) ?? {});
+  console.log('[banlist] banned_user_debug', {
+    idx,
+    topKeys,
+    dataKeys,
+    extracted,
+    mapping,
+    excluded,
+    cfg,
+    raw: userToPlain(u),
+  });
+}
+
+// -------------------- Ban listing extraction (defensive) --------------------
+function pickBanName(u: any): string {
+  return String(u?.name ?? u?.username ?? u?.data?.name ?? u?.data?.username ?? '').trim();
+}
+
+function pickBanNote(u: any): string {
+  const src = u?.data ?? u;
+  const noteRaw =
+    src?.note ??
+    src?.ban_note ??
+    src?.banNote ??
+    src?.mod_note ??
+    src?.modNote ??
+    src?.user_note ??
+    src?.userNote ??
+    src?.note_text ??
+    src?.noteText ??
+    src?.note_markdown ??
+    src?.noteMarkdown ??
+    src?.ban_note_markdown ??
+    src?.banNoteMarkdown;
+  return String(noteRaw ?? '').trim();
+}
+
+function pickBanReason(u: any): string {
+  const src = u?.data ?? u;
+  const reasonRaw =
+    src?.reason ??
+    src?.ban_reason ??
+    src?.banReason ??
+    src?.rule_reason ??
+    src?.reason_text ??
+    src?.reasonText ??
+    src?.rule ??
+    src?.ban_rule ??
+    src?.banRule;
+  return String(reasonRaw ?? '').trim();
+}
+
+async function fetchBannedUsers(ctx: Context, subredditName: string, limit: number, verbose: boolean): Promise<{ rows: BannedListingRow[]; sampleObj: any; sampleKeys: string[]; sampleDataKeys: string[] }> {
+  const pageSize = 100;
+  const out: BannedListingRow[] = [];
+  const seen = new Set<string>();
+
+  // @ts-ignore
+  const listing: any = await ctx.reddit.getBannedUsers({ subredditName, limit: Math.min(pageSize, limit), pageSize });
+  const hasPrivateFetch = typeof listing?._fetch === 'function';
+
+  const extractChildren = (pageObj: any): any[] =>
+    (pageObj?.children as any[]) ?? (pageObj?.data?.children as any[]) ?? [];
+
+  let sampleObj: any = null;
+  let sampleKeys: string[] = [];
+  let sampleDataKeys: string[] = [];
+
+  const addUsers = (users: any[]) => {
+    for (const u of users ?? []) {
+      if (!sampleObj) {
+        sampleObj = u;
+        sampleKeys = Object.keys(u ?? {});
+        sampleDataKeys = Object.keys((u?.data ?? {}) ?? {});
+      }
+
+      const name = pickBanName(u);
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const note = pickBanNote(u);
+      const reason = pickBanReason(u);
+      const raw = (note || reason || '').trim();
+
+      out.push({ name, note, reason, raw });
+      if (out.length >= limit) break;
+    }
+  };
+
+  if (verbose) console.log('[banlist] fetchBannedUsers start', { hasPrivateFetch, limit });
+
+  if (hasPrivateFetch) {
+    let after: string | null = null;
+    let loops = 0;
+
+    while (out.length < limit && loops < 300) {
+      loops++;
+
+      // @ts-ignore
+      const pageObj = await listing._fetch({
+        subredditName,
+        limit: Math.min(pageSize, Math.max(0, limit - out.length)),
+        pageSize,
+        after: after ?? undefined,
+      });
+
+      const users = extractChildren(pageObj);
+      addUsers(users);
+
+      const nextAfter: string | null =
+        (typeof pageObj?.after === 'string' ? pageObj.after : null) ??
+        (typeof pageObj?.data?.after === 'string' ? pageObj.data.after : null);
+
+      if (!users || users.length === 0) break;
+      if (nextAfter && nextAfter !== after) {
+        after = nextAfter;
+        continue;
+      }
+      if (users.length < pageSize) break;
+      break;
+    }
+
+    if (verbose) console.log('[banlist] fetchBannedUsers done', { total: out.length, loops });
+    return { rows: out, sampleObj, sampleKeys, sampleDataKeys };
+  }
+
+  // fallback: try listing children or .all()
+  let users: any[] = extractChildren(listing);
+  if ((!users || users.length === 0) && typeof listing?.all === 'function') {
+    // @ts-ignore
+    users = (await listing.all()) ?? [];
+  }
+  addUsers(users);
+
+  if (verbose) console.log('[banlist] fetchBannedUsers done (fallback)', { total: out.length });
+  return { rows: out, sampleObj, sampleKeys, sampleDataKeys };
+}
+
+// -------------------- Post editability helpers --------------------
 function toBoolStrict(v: any): boolean {
   if (v === true) return true;
   if (v === false) return false;
@@ -415,698 +493,428 @@ function toBoolStrict(v: any): boolean {
   return false;
 }
 
-async function getEditability(reddit: RedditAPIClient, postId: string): Promise<{
-  fetchOk: boolean;
-  archivedRaw: any;
-  archived: boolean;
-  lockedRaw: any;
-  locked: boolean;
-  canEdit: boolean;
-  reasonIfNot: string | null;
-}> {
+async function canEditPost(reddit: RedditAPIClient, postId: string): Promise<{ ok: boolean; canEdit: boolean; reason?: string }> {
   try {
     const post = await reddit.getPostById(postId);
     const archivedRaw = (post as any)?.isArchived ?? (post as any)?.archived;
     const lockedRaw = (post as any)?.isLocked ?? (post as any)?.locked;
-
     const archived = toBoolStrict(archivedRaw);
     const locked = toBoolStrict(lockedRaw);
-
-    if (archived) return { fetchOk: true, archivedRaw, archived, lockedRaw, locked, canEdit: false, reasonIfNot: 'archived' };
-    if (locked) return { fetchOk: true, archivedRaw, archived, lockedRaw, locked, canEdit: false, reasonIfNot: 'locked' };
-
-    return { fetchOk: true, archivedRaw, archived, lockedRaw, locked, canEdit: true, reasonIfNot: null };
+    if (archived) return { ok: true, canEdit: false, reason: 'archived' };
+    if (locked) return { ok: true, canEdit: false, reason: 'locked' };
+    return { ok: true, canEdit: true };
   } catch {
-    return {
-      fetchOk: false,
-      archivedRaw: undefined,
-      archived: false,
-      lockedRaw: undefined,
-      locked: false,
-      canEdit: false,
-      reasonIfNot: 'fetch_failed_deleted_removed_or_missing',
-    };
+    return { ok: false, canEdit: false, reason: 'fetch_failed' };
   }
 }
 
-// -------------------- Mapping + output --------------------
-function mapTextToLabelWithMatch(text: string, rules: MappingRule[], defaultLabel: string): { label: string; matched: boolean } {
-  const r = (text ?? '').toLowerCase();
-  for (const rule of rules) {
-    if (rule.keywords.some((kw) => kw && r.includes(kw))) return { label: rule.label, matched: true };
-  }
-  return { label: defaultLabel, matched: false };
-}
-
-function escapeMd(text: string): string {
-  return (text ?? '').replaceAll('|', '\\|').trim();
-}
-
-function applyMappedPrefixToReason(reason: string, mappedLabel: string): string {
-  const s = String(reason ?? '').trim();
-  const idx = s.indexOf(':');
-  if (idx > 0) {
-    const suffix = s.slice(idx); // includes ": ..."
-    return `${mappedLabel}${suffix}`;
-  }
-  return mappedLabel ? `${mappedLabel}${s ? `: ${s}` : ''}` : s;
-}
-
-function buildMarkdown(sub: string, rows: Row[], cfg: SettingsConfig): string {
-  const updated = new Date().toISOString();
-  const header =
-    `# Banned Users List\n\n` +
-    `**Subreddit:** r/${sub}\n` +
-    `**Last updated:** ${updated}\n\n`;
-
-  if (!rows.length) return `${header}_No banned users found (or app lacks permission)._`;
-
-  const showCategory = cfg.showCategory;
-  const showReason = cfg.showReason;
-
-  if (cfg.outputMode === 'bullets' || (!showCategory && !showReason)) {
-    const lines = rows.map((r) => {
-      if (showCategory && showReason) return `- ${r.user} — **${escapeMd(r.category)}** — ${escapeMd(r.reason)}`;
-      if (showCategory && !showReason) return `- ${r.user} — **${escapeMd(r.category)}**`;
-      if (!showCategory && showReason) return `- ${r.user} — ${escapeMd(r.reason)}`;
-      return `- ${r.user}`;
-    });
-    return `${header}${lines.join('\n')}\n`;
-  }
-
-  const cols: string[] = ['User'];
-  if (showCategory) cols.push('Category');
-  if (showReason) cols.push('Ban reason / rule');
-
-  const sep = `| ${cols.join(' | ')} |\n| ${cols.map(() => '---').join(' | ')} |`;
-
-  const body = rows
-    .map((r) => {
-      const parts: string[] = [escapeMd(r.user)];
-      if (showCategory) parts.push(escapeMd(r.category));
-      if (showReason) parts.push(escapeMd(r.reason));
-      return `| ${parts.join(' | ')} |`;
-    })
-    .join('\n');
-
-  return `${header}${sep}\n${body}\n`;
-}
-
-// -------------------- Fetch banned users (up to 1000) --------------------
-async function fetchBannedUsernames(ctx: Context, subredditName: string, limit: number, verbose: boolean): Promise<string[]> {
-  // @ts-ignore
-  const listing = await ctx.reddit.getBannedUsers({ subredditName, limit, pageSize: 100 });
-  // @ts-ignore
-  const users = await listing.all();
-
-  const names = (users ?? [])
-    .map((u: any) => String(u?.name ?? u?.username ?? '').trim())
-    .filter(Boolean);
-
-  if (verbose) console.log(`[banlist] getBannedUsers -> ${names.length} users (limit=${limit})`);
-  return names;
-}
-
-// -------------------- Fetch ban reasons via modlog (banuser) --------------------
-type ReasonHit = { reason: string; createdAt?: string; mod?: string };
-
-function pickReasonFromModAction(ma: any): string {
-  const desc = String(ma?.description ?? '').trim();
-  const det = String(ma?.details ?? '').trim();
-  if (det && desc) return `${desc}: ${det}`;
-  if (det) return det;
-  if (desc) return desc;
-  return '';
-}
-
-async function buildReasonMapFromModlog(
-  reddit: RedditAPIClient,
-  subredditName: string,
-  lookbackLimit: number,
-  verbose: boolean,
-  report: DebugReport
-): Promise<Map<string, ReasonHit>> {
-  // @ts-ignore
-  const listing = await reddit.getModerationLog({
-    subredditName,
-    type: 'banuser',
-    limit: lookbackLimit,
-    pageSize: Math.min(100, lookbackLimit),
-  });
-  // @ts-ignore
-  const actions = await listing.all();
-
-  report.modlog.fetched = (actions ?? []).length;
-  if (verbose) console.log(`[banlist] getModerationLog(type=banuser) fetched=${report.modlog.fetched} lookbackLimit=${lookbackLimit}`);
-
-  const map = new Map<string, ReasonHit>();
-
-  let sampleEntryKeys: string[] = [];
-  let sampleTargetKeys: string[] = [];
-
-  for (const a of actions ?? []) {
-    if (!sampleEntryKeys.length) sampleEntryKeys = Object.keys(a ?? {});
-    const target = (a as any)?.target;
-    if (target && !sampleTargetKeys.length) sampleTargetKeys = Object.keys(target ?? {});
-    const author = String(target?.author ?? '').trim();
-    if (!author) continue;
-
-    const reason = pickReasonFromModAction(a);
-    const createdAt = (a as any)?.createdAt ? String((a as any).createdAt) : undefined;
-    const mod = String((a as any)?.moderatorName ?? '').trim() || undefined;
-
-    if (!map.has(author)) map.set(author, { reason, createdAt, mod });
-  }
-
-  report.modlog.sampleEntryKeys = sampleEntryKeys;
-  report.modlog.sampleTargetKeys = sampleTargetKeys;
-
-  if (verbose) {
-    console.log('[banlist] modlog sample entry keys=', sampleEntryKeys);
-    console.log('[banlist] modlog sample target keys=', sampleTargetKeys);
-    console.log(`[banlist] modlog reason map size=${map.size}`);
-  }
-
-  return map;
-}
-
-// -------------------- Mod notes fallback --------------------
-async function fetchLatestModNoteText(
-  reddit: RedditAPIClient,
-  subredditName: string,
-  username: string,
-  limit: number,
-  verbose: boolean
-): Promise<{ note: string; error?: string }> {
-  try {
-    // @ts-ignore
-    const listing = await reddit.getModNotes({
-      subreddit: subredditName,
-      user: username,
-      limit: Math.max(1, limit),
-    });
-    // @ts-ignore
-    const notes = await listing.all();
-    const first = (notes ?? [])[0];
-
-    const text = (first as any)?.note ?? (first as any)?.text ?? (first as any)?.body ?? '';
-    const note = String(text ?? '').trim();
-
-    if (verbose) console.log(`[banlist] getModNotes(u/${username}) count=${(notes ?? []).length} note="${note.slice(0, 160)}"`);
-    return { note };
-  } catch (e: any) {
-    const msg = e?.cause?.details ?? e?.message ?? String(e);
-    if (verbose) console.log(`[banlist] getModNotes failed u/${username}: ${msg}`);
-    return { note: '', error: msg };
-  }
-}
-
-// -------------------- Scheduler: schedule ONLY if needed --------------------
-async function ensureSingleCronScheduled(ctx: Context, cfg: SettingsConfig, report: DebugReport): Promise<void> {
+// -------------------- Scheduler control (avoid cron limit) --------------------
+async function ensureSingleCronScheduled(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<void> {
   const sub = ctx.subredditName!;
-  const cronKey = kvCronKey(sub, cfg.idKey);
-  const jobKey = kvJobIdKey(sub, cfg.idKey);
+  const cronKey = kvCronKey(sub, cfg.postIdKey);
+  const jobKey = kvJobIdKey(sub, cfg.postIdKey);
 
-  report.scheduler.kvCronKey = cronKey;
-  report.scheduler.kvJobIdKey = jobKey;
-  report.scheduler.prevCron = await ctx.kvStore.get(cronKey);
-  report.scheduler.prevJobId = await ctx.kvStore.get(jobKey);
+  const prevCron = (await ctx.kvStore.get(cronKey)) ?? null;
+  const prevJobId = (await ctx.kvStore.get(jobKey)) ?? null;
 
-  report.scheduler.cancelAttempted = false;
-  report.scheduler.scheduleAttempted = false;
+  snap.scheduler.prevCron = prevCron;
+  snap.scheduler.prevJobId = prevJobId;
 
   if (!cfg.scheduleEnabled) {
-    report.scheduler.note.push('scheduleEnabled=false -> clearing stored cron/job');
-    const prevJobId = report.scheduler.prevJobId ?? null;
-    if (prevJobId && typeof (ctx.scheduler as any)?.cancelJob === 'function') {
-      report.scheduler.cancelAttempted = true;
-      try {
-        await (ctx.scheduler as any).cancelJob(prevJobId);
-        report.scheduler.cancelSucceeded = true;
-      } catch (e: any) {
-        report.scheduler.cancelSucceeded = false;
-        report.scheduler.note.push(`cancelJob failed: ${e?.message ?? String(e)}`);
-      }
-    }
-    await ctx.kvStore.delete(cronKey);
-    await ctx.kvStore.delete(jobKey);
+    snap.scheduler.note.push('scheduleEnabled=false -> not scheduling');
     return;
   }
 
-  const prevCron = report.scheduler.prevCron ?? null;
-  const prevJobId = report.scheduler.prevJobId ?? null;
-
-  // ✅ do NOT reschedule if unchanged + have jobId (prevents cron limit)
+  // If unchanged and we have a jobId, do nothing.
   if (prevCron === cfg.scheduleCron && prevJobId) {
-    report.scheduler.note.push('cron unchanged + have jobId -> not rescheduling (avoids cron limit)');
+    snap.scheduler.note.push('cron unchanged + jobId exists -> not rescheduling');
     return;
   }
 
-  // cancel stored jobId best-effort
+  // Cancel previous job if possible
   if (prevJobId && typeof (ctx.scheduler as any)?.cancelJob === 'function') {
-    report.scheduler.cancelAttempted = true;
     try {
       await (ctx.scheduler as any).cancelJob(prevJobId);
-      report.scheduler.cancelSucceeded = true;
-      report.scheduler.note.push(`canceled previous jobId=${prevJobId}`);
+      snap.scheduler.note.push(`canceled previous jobId=${prevJobId}`);
     } catch (e: any) {
-      report.scheduler.cancelSucceeded = false;
-      report.scheduler.note.push(`cancelJob failed (continuing): ${e?.message ?? String(e)}`);
+      snap.scheduler.note.push(`cancelJob failed (continuing): ${e?.message ?? String(e)}`);
     }
   }
 
-  report.scheduler.scheduleAttempted = true;
+  // Schedule new
   try {
     const newJobId = await ctx.scheduler.runJob({
-      name: JOB_NAME,
+      name: JOB_NAME_NEW,
       cron: cfg.scheduleCron,
-      data: { idKey: cfg.idKey },
+      data: { idKey: cfg.postIdKey },
     } as any);
 
-    const jobIdStr = String(newJobId);
-    await ctx.kvStore.put(jobKey, jobIdStr);
+    const newJobIdStr = String(newJobId);
+    await ctx.kvStore.put(jobKey, newJobIdStr);
     await ctx.kvStore.put(cronKey, cfg.scheduleCron);
 
-    report.scheduler.scheduleSucceeded = true;
-    report.scheduler.scheduleJobId = jobIdStr;
-    report.scheduler.note.push(`scheduled jobId=${jobIdStr} cron=${cfg.scheduleCron}`);
+    snap.scheduler.newJobId = newJobIdStr;
+    snap.scheduler.note.push(`scheduled jobId=${newJobIdStr} cron=${cfg.scheduleCron}`);
   } catch (e: any) {
     const msg = e?.cause?.details ?? e?.message ?? String(e);
-    report.scheduler.scheduleSucceeded = false;
-    report.scheduler.scheduleError = msg;
-    report.scheduler.note.push(`schedule failed: ${msg}`);
+    snap.scheduler.error = msg;
+    snap.scheduler.note.push(`schedule failed: ${msg}`);
   }
 }
 
-// -------------------- Manual PURGE + reschedule (best-effort) --------------------
-async function purgeOldCronsAndReschedule(ctx: Context, cfg: SettingsConfig, report: DebugReport): Promise<string[]> {
+async function purgeOldCronsAndReschedule(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<string[]> {
   const sub = ctx.subredditName!;
-  const jobKey = kvJobIdKey(sub, cfg.idKey);
-  const cronKey = kvCronKey(sub, cfg.idKey);
+  const jobKey = kvJobIdKey(sub, cfg.postIdKey);
+  const cronKey = kvCronKey(sub, cfg.postIdKey);
 
   const canceled: string[] = [];
-  report.scheduler.purgeAttempted = true;
-
   const canList = typeof (ctx.scheduler as any)?.listJobs === 'function';
   const canCancel = typeof (ctx.scheduler as any)?.cancelJob === 'function';
 
-  const storedJobId = await ctx.kvStore.get(jobKey);
-  const storedCron = await ctx.kvStore.get(cronKey);
-
-  if (cfg.debugVerbose) {
-    console.log(`[banlist] PURGE start idKey=${cfg.idKey} storedJobId=${storedJobId ?? 'none'} storedCron=${storedCron ?? 'none'}`);
-    console.log(`[banlist] scheduler supports listJobs=${canList} cancelJob=${canCancel}`);
-  }
-
-  // Cancel stored jobId first (best-effort)
+  const storedJobId = (await ctx.kvStore.get(jobKey)) ?? null;
   if (canCancel && storedJobId) {
     try {
       await (ctx.scheduler as any).cancelJob(storedJobId);
       canceled.push(storedJobId);
-      if (cfg.debugVerbose) console.log(`[banlist] PURGE canceled stored jobId=${storedJobId}`);
+      snap.scheduler.note.push(`purge canceled stored jobId=${storedJobId}`);
     } catch (e: any) {
-      if (cfg.debugVerbose) console.log(`[banlist] PURGE cancel stored jobId failed: ${e?.message ?? String(e)}`);
+      snap.scheduler.note.push(`purge cancel stored jobId failed: ${e?.message ?? String(e)}`);
     }
   }
 
-  // If listJobs exists, cancel all cron jobs for this app job name + (idKey if available)
   if (canList && canCancel) {
     try {
       const jobs = await (ctx.scheduler as any).listJobs();
-      if (cfg.debugVerbose) console.log(`[banlist] PURGE listJobs -> ${jobs?.length ?? 0}`);
-
       for (const j of jobs ?? []) {
         const isCron = typeof j?.cron === 'string' && j.cron.length > 0;
-        const isSameName = j?.name === JOB_NAME;
+        const isOurName = j?.name === JOB_NAME_NEW || j?.name === JOB_NAME_LEGACY;
+        if (!isCron || !isOurName) continue;
 
+        // If data.idKey exists, match it; otherwise cancel anyway (best effort cleanup)
         const dataIdKey = j?.data?.idKey ? String(j.data.idKey) : null;
-        const matchesIdKey = dataIdKey ? dataIdKey === cfg.idKey : true;
+        if (dataIdKey && dataIdKey !== cfg.postIdKey) continue;
 
-        if (isCron && isSameName && matchesIdKey) {
-          try {
-            const jid = String(j.id);
-            await (ctx.scheduler as any).cancelJob(jid);
-            canceled.push(jid);
-            if (cfg.debugVerbose) console.log(`[banlist] PURGE canceled jobId=${jid} cron=${j.cron} dataIdKey=${dataIdKey ?? 'none'}`);
-          } catch (e: any) {
-            if (cfg.debugVerbose) console.log(`[banlist] PURGE cancel jobId=${j?.id} failed: ${e?.message ?? String(e)}`);
-          }
+        try {
+          const jid = String(j.id);
+          await (ctx.scheduler as any).cancelJob(jid);
+          canceled.push(jid);
+        } catch {
+          // ignore
         }
       }
+      snap.scheduler.note.push(`purge listJobs canceled=${canceled.length}`);
     } catch (e: any) {
-      if (cfg.debugVerbose) console.log(`[banlist] PURGE listJobs failed: ${e?.message ?? String(e)}`);
-      report.scheduler.note.push(`PURGE listJobs failed: ${e?.message ?? String(e)}`);
+      snap.scheduler.note.push(`purge listJobs failed: ${e?.message ?? String(e)}`);
     }
   } else {
-    report.scheduler.note.push('PURGE: listJobs/cancelJob not supported in this runtime; canceled stored jobId only (if any)');
+    snap.scheduler.note.push('purge: listJobs/cancelJob not available; only stored jobId attempted');
   }
 
-  report.scheduler.purgeCanceledJobIds = canceled;
+  // Clear KV schedule tracking
+  try { await ctx.kvStore.delete(jobKey); } catch {}
+  try { await ctx.kvStore.delete(cronKey); } catch {}
 
-  // Clear KV so ensureSingleCronScheduled schedules cleanly
-  await ctx.kvStore.delete(jobKey);
-  await ctx.kvStore.delete(cronKey);
-
-  // Now schedule ONE fresh cron using normal safe logic
-  await ensureSingleCronScheduled(ctx, cfg, report);
+  // Reschedule
+  await ensureSingleCronScheduled(ctx, cfg, snap);
 
   return canceled;
 }
 
-// -------------------- Build final rows --------------------
-async function buildRows(ctx: Context, cfg: SettingsConfig, report: DebugReport): Promise<Row[]> {
+// -------------------- Build rows --------------------
+async function buildRows(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<Array<{ name: string; note: string; raw: string; label: string }>> {
   const sub = ctx.subredditName!;
   const verbose = cfg.debugVerbose;
 
-  const bannedUsernames = await fetchBannedUsernames(ctx, sub, cfg.banListLimit, verbose);
-  report.bannedUsers.count = bannedUsernames.length;
-  report.bannedUsers.sample = bannedUsernames.slice(0, 10);
+  const fetched = await fetchBannedUsers(ctx, sub, cfg.banListLimit, verbose);
+  const banned = fetched.rows;
 
-  const reasonMap = await buildReasonMapFromModlog(ctx.reddit, sub, cfg.modlogLookbackLimit, verbose, report);
+  snap.bans.total = banned.length;
+  snap.bans.sample = fetched.sampleObj ? [fetched.sampleObj] : [];
+  snap.bans.sampleKeys = fetched.sampleKeys;
+  snap.bans.sampleDataKeys = fetched.sampleDataKeys;
 
-  let modNotesAttempts = 0;
-  let modNotesFailures = 0;
+  let excludedByText = 0;
+  let excludedByLabel = 0;
 
-  let excludedCount = 0;
-  let mappedFromModlog = 0;
-  let missingFromModlog = 0;
+  const out: Array<{ name: string; note: string; raw: string; label: string }> = [];
 
-  const rows: Row[] = [];
-
-  for (const u of bannedUsernames) {
-    let reason = '';
-    const hit = reasonMap.get(u);
-    if (hit?.reason) {
-      reason = hit.reason;
-      mappedFromModlog += 1;
-    } else {
-      missingFromModlog += 1;
-    }
-
-    if (!reason && (cfg.reasonSource === 'mod_note' || cfg.reasonSource === 'modlog_then_modnote')) {
-      modNotesAttempts += 1;
-      const { note, error } = await fetchLatestModNoteText(ctx.reddit, sub, u, cfg.modNotesPerUser, verbose);
-      if (error) modNotesFailures += 1;
-      reason = note ?? '';
-    }
-
-    const reasonLower = (reason ?? '').toLowerCase();
-    const excluded = cfg.excludeNeedles.some((n) => n && reasonLower.includes(n));
-    if (excluded) {
-      excludedCount += 1;
+  for (const u of banned) {
+    const combinedText = `${u.note} ${u.reason}`.toLowerCase();
+    const excludedText = cfg.excludeIfTextContains.some((needle) => needle && combinedText.includes(needle));
+    if (excludedText) {
+      excludedByText += 1;
       continue;
     }
 
-    // Mapping with match flag
-    const mapped = mapTextToLabelWithMatch(reason, cfg.mappingRules, cfg.defaultLabel);
-    const category = mapped.label;
+    // bookmarklet-style: use NOTE; fallback to REASON
+    const baseRaw = (u.note || u.reason || '').trim();
+    const maybeMasked = cfg.maskUsernamesInNote ? maskUsernamesInsideNote(baseRaw) : baseRaw;
 
-    // ✅ Prefix rewrite behavior you requested
-    if (cfg.applyMappingToReasonPrefix && reason) {
-      if (!cfg.reasonPrefixOnlyIfMapped || mapped.matched) {
-        reason = applyMappedPrefixToReason(reason, category);
-      }
-      // else: keep original reason unchanged
+    const mapped = maybeMasked
+      ? mapTextToLabel(maybeMasked, cfg.mappingRules, cfg.defaultLabel)
+      : { label: cfg.defaultLabel, matched: false };
+
+    const label = (mapped.label || cfg.defaultLabel).trim() || cfg.defaultLabel;
+    const labelLower = label.toLowerCase();
+
+    const excludedLabel = cfg.excludeIfMappedLabelIn.some((l) => l && l === labelLower);
+    if (excludedLabel) {
+      excludedByLabel += 1;
+      continue;
     }
 
-    rows.push({ user: `u/${u}`, category, reason });
+    out.push({ name: u.name, note: label, raw: baseRaw, label });
   }
 
-  report.modlog.mapped = mappedFromModlog;
-  report.modlog.missing = missingFromModlog;
-  report.modNotes.attempts = modNotesAttempts;
-  report.modNotes.failures = modNotesFailures;
+  if (cfg.sortBy === 'note_asc') out.sort((a, b) => a.note.localeCompare(b.note));
+  else out.sort((a, b) => a.name.localeCompare(b.name));
 
-  report.rows.excludedCount = excludedCount;
+  snap.rows.excludedByText = excludedByText;
+  snap.rows.excludedByLabel = excludedByLabel;
 
-  rows.sort((a, b) => a.user.localeCompare(b.user));
+  snap.rows.sample = out.slice(0, 10).map((r) => ({ u: `u/${r.name}`, raw: r.raw, label: r.label }));
 
-  // Cap rows in post (safety)
-  let truncated = false;
-  let finalRows = rows;
-  if (rows.length > cfg.maxRowsInPost) {
-    truncated = true;
-    finalRows = rows.slice(0, cfg.maxRowsInPost);
-  }
-
-  report.rows.finalCount = finalRows.length;
-  report.rows.truncated = truncated;
-  report.rows.sample = finalRows.slice(0, 10);
-
-  if (verbose) {
-    console.log(
-      `[banlist] rows final=${finalRows.length} excluded=${excludedCount} modlogMapped=${mappedFromModlog} modlogMissing=${missingFromModlog} truncated=${truncated}`
-    );
-  }
-
-  return finalRows;
+  return out;
 }
 
-// -------------------- Publish --------------------
-async function runPublish(ctx: Context, actor: Actor, mode: DebugReport['post']['mode']) {
-  const sub = ctx.subredditName!;
+// -------------------- Core run --------------------
+async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: RunMode): Promise<{ rows: number; postId: string | null; action: string }> {
+  const sub = ctx.subredditName;
+  if (!sub) return { rows: 0, postId: null, action: 'no_subreddit' };
+
   const cfg = await getCfg(ctx);
 
-  const report: DebugReport = {
+  const snap: DebugSnapshot = {
     ts: new Date().toISOString(),
     subreddit: sub,
-    idKey: cfg.idKey,
+    idKey: cfg.postIdKey,
     actor,
-
-    settings: {
-      title: cfg.title,
+    cfg: {
       scheduleEnabled: cfg.scheduleEnabled,
       scheduleCron: cfg.scheduleCron,
-      fallbackCron: cfg.fallbackCron,
-      fallbackManualUpdate: cfg.fallbackManualUpdate,
-      setNewPostAsActive: cfg.setNewPostAsActive,
-      reasonSource: cfg.reasonSource,
-      showCategory: cfg.showCategory,
-      showReason: cfg.showReason,
-      outputMode: cfg.outputMode,
-      applyMappingToReasonPrefix: cfg.applyMappingToReasonPrefix,
-      reasonPrefixOnlyIfMapped: cfg.reasonPrefixOnlyIfMapped,
-      sort: cfg.sort,
-      excludeNeedles: cfg.excludeNeedles,
-      modNotesPerUser: cfg.modNotesPerUser,
-      modlogLookbackLimit: cfg.modlogLookbackLimit,
       banListLimit: cfg.banListLimit,
       maxRowsInPost: cfg.maxRowsInPost,
+      excludeIfTextContains: cfg.excludeIfTextContains,
+      excludeIfMappedLabelIn: cfg.excludeIfMappedLabelIn,
       mappingRulesCount: cfg.mappingRules.length,
-      debugVerbose: cfg.debugVerbose,
+      defaultLabel: cfg.defaultLabel,
+      maskUsernamesInNote: cfg.maskUsernamesInNote,
+      sortBy: cfg.sortBy,
+      createNewOnEditFail: cfg.createNewOnEditFail,
+      setNewPostAsActive: cfg.setNewPostAsActive,
     },
-
-    bannedUsers: { count: 0, sample: [] },
-    modlog: { fetched: 0, mapped: 0, missing: 0, sampleEntryKeys: [], sampleTargetKeys: [] },
-    modNotes: { attempts: 0, failures: 0 },
-    rows: { finalCount: 0, excludedCount: 0, truncated: false, sample: [] },
-
-    post: { kvPostKey: kvPostKey(sub, cfg.idKey), storedPostId: null, mode },
-
-    scheduler: {
-      kvCronKey: kvCronKey(sub, cfg.idKey),
-      kvJobIdKey: kvJobIdKey(sub, cfg.idKey),
-      prevCron: null,
-      prevJobId: null,
-      cancelAttempted: false,
-      scheduleAttempted: false,
-      note: [],
-    },
-
-    notes: [],
+    bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
+    rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+    post: { storedPostId: null, action: 'none', finalPostId: null },
+    scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
   };
 
-  if (cfg.mappingParseError) {
-    report.notes.push(`mappingJson parse error: ${cfg.mappingParseError}`);
-    console.log(`[banlist] mappingJson parse error: ${cfg.mappingParseError}`);
-  }
+  if (cfg.debugVerbose) console.log('[banlist] runPublish', { actor, mode, sub, idKey: cfg.postIdKey });
 
-  console.log(`[banlist] START actor=${actor} mode=${mode} sub=${sub} idKey=${cfg.idKey}`);
+  const built = await buildRows(ctx, cfg, snap);
+  const rows = built.map((r) => ({ name: r.name, note: r.note }));
+  snap.rows.out = rows.length;
 
-  const rows = await buildRows(ctx, cfg, report);
-  const body = buildMarkdown(sub, rows, cfg);
+  const body = buildMarkdown(sub, cfg.postTitle, rows, cfg.maxRowsInPost);
 
-  // Manual create modes
+  const stored = await readStoredPostRef(ctx, cfg.postIdKey);
+  snap.post.storedPostId = stored?.postId ?? null;
+
+  // Create modes
   if (mode === 'create_new_and_set_active' || mode === 'create_new_no_change_active') {
-    report.post.createAttempted = true;
-    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.title, text: body });
-    report.post.createSucceeded = true;
-    report.post.createdPostId = created.id;
+    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
+    snap.post.action = mode === 'create_new_and_set_active' ? 'created_set_active' : 'created_not_active';
+    snap.post.finalPostId = created.id;
 
     if (mode === 'create_new_and_set_active') {
-      await writeStoredPostRef(ctx, cfg.idKey, created.id);
-      report.post.didSetNewActive = true;
-      report.post.finalActivePostId = created.id;
-    } else {
-      const stored = await readStoredPostRef(ctx, cfg.idKey);
-      report.post.didSetNewActive = false;
-      report.post.finalActivePostId = stored?.postId ?? null;
+      await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
     }
 
-    await writeDebug(ctx, cfg.idKey, report);
-    return { ok: true, created: true, postId: created.id, rows: rows.length };
+    await writeDebug(ctx, cfg.postIdKey, snap);
+    return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 
-  // update_existing_only
-  const stored = await readStoredPostRef(ctx, cfg.idKey);
-  report.post.storedPostId = stored?.postId ?? null;
-
+  // Update existing only
   if (!stored?.postId) {
-    const fb = decideFallback(cfg, actor === 'cron' ? 'cron' : 'manual_update');
-    report.post.fallbackChosen = fb;
+    // No stored post -> create and set active (always)
+    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
+    await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
+    snap.post.action = 'created_no_stored_active_set';
+    snap.post.finalPostId = created.id;
 
-    if (fb === 'do_nothing') {
-      report.post.skipped = true;
-      report.post.skippedReason = 'No stored postId; configured to do nothing.';
-      await writeDebug(ctx, cfg.idKey, report);
-      return { ok: true, created: false, skipped: true, postId: null, rows: rows.length };
-    }
-
-    report.post.createAttempted = true;
-    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.title, text: body });
-    report.post.createSucceeded = true;
-    report.post.createdPostId = created.id;
-
-    if (cfg.setNewPostAsActive) {
-      await writeStoredPostRef(ctx, cfg.idKey, created.id);
-      report.post.didSetNewActive = true;
-      report.post.finalActivePostId = created.id;
-    } else {
-      report.post.didSetNewActive = false;
-      report.post.finalActivePostId = null;
-    }
-
-    await writeDebug(ctx, cfg.idKey, report);
-    return { ok: true, created: true, postId: created.id, rows: rows.length };
+    await writeDebug(ctx, cfg.postIdKey, snap);
+    return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 
-  // Check editability
-  const ed = await getEditability(ctx.reddit, stored.postId);
-  report.post.fetchOk = ed.fetchOk;
-  report.post.archivedRaw = ed.archivedRaw;
-  report.post.archivedParsed = ed.archived;
-  report.post.lockedRaw = ed.lockedRaw;
-  report.post.lockedParsed = ed.locked;
-  report.post.canEdit = ed.canEdit;
-  report.post.notEditableReason = ed.reasonIfNot;
-
-  if (!ed.canEdit) {
-    const fb = decideFallback(cfg, actor === 'cron' ? 'cron' : 'manual_update');
-    report.post.fallbackChosen = fb;
-
-    if (fb === 'do_nothing') {
-      report.post.skipped = true;
-      report.post.skippedReason = `Active post not editable (${ed.reasonIfNot}); configured to do nothing.`;
-      report.post.finalActivePostId = stored.postId;
-      await writeDebug(ctx, cfg.idKey, report);
-      return { ok: true, created: false, skipped: true, postId: stored.postId, rows: rows.length };
+  // Try edit active post
+  const editable = await canEditPost(ctx.reddit, stored.postId);
+  if (!editable.canEdit) {
+    if (!cfg.createNewOnEditFail) {
+      snap.post.action = `skipped_not_editable_${editable.reason ?? 'unknown'}`;
+      snap.post.finalPostId = stored.postId;
+      await writeDebug(ctx, cfg.postIdKey, snap);
+      return { rows: rows.length, postId: stored.postId, action: snap.post.action };
     }
 
-    report.post.createAttempted = true;
-    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.title, text: body });
-    report.post.createSucceeded = true;
-    report.post.createdPostId = created.id;
+    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
+    snap.post.action = `created_on_uneditable_${editable.reason ?? 'unknown'}`;
+    snap.post.finalPostId = created.id;
 
-    if (cfg.setNewPostAsActive) {
-      await writeStoredPostRef(ctx, cfg.idKey, created.id);
-      report.post.didSetNewActive = true;
-      report.post.finalActivePostId = created.id;
-    } else {
-      report.post.didSetNewActive = false;
-      report.post.finalActivePostId = stored.postId;
-    }
+    if (cfg.setNewPostAsActive) await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
 
-    await writeDebug(ctx, cfg.idKey, report);
-    return { ok: true, created: true, postId: created.id, rows: rows.length };
+    await writeDebug(ctx, cfg.postIdKey, snap);
+    return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 
-  // Editable -> edit existing post
-  report.post.editAttempted = true;
   try {
     const post = await ctx.reddit.getPostById(stored.postId);
     await post.edit({ text: body });
 
-    report.post.editSucceeded = true;
-    report.post.finalActivePostId = stored.postId;
+    snap.post.action = 'edited_active';
+    snap.post.finalPostId = stored.postId;
 
-    await writeDebug(ctx, cfg.idKey, report);
-    return { ok: true, created: false, postId: stored.postId, rows: rows.length };
+    await writeDebug(ctx, cfg.postIdKey, snap);
+    return { rows: rows.length, postId: stored.postId, action: snap.post.action };
   } catch (e: any) {
     const msg = e?.cause?.details ?? e?.message ?? String(e);
-    report.post.editSucceeded = false;
-    report.post.editError = msg;
+    snap.post.error = msg;
 
-    report.post.skipped = true;
-    report.post.skippedReason = `Edit failed; not creating fallback post automatically: ${msg}`;
+    if (!cfg.createNewOnEditFail) {
+      snap.post.action = 'edit_failed_no_fallback';
+      snap.post.finalPostId = stored.postId;
+      await writeDebug(ctx, cfg.postIdKey, snap);
+      return { rows: rows.length, postId: stored.postId, action: snap.post.action };
+    }
 
-    await writeDebug(ctx, cfg.idKey, report);
-    return { ok: false, created: false, skipped: true, postId: stored.postId, rows: rows.length };
+    const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
+    snap.post.action = 'edit_failed_created_fallback';
+    snap.post.finalPostId = created.id;
+
+    if (cfg.setNewPostAsActive) await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
+
+    await writeDebug(ctx, cfg.postIdKey, snap);
+    return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 }
 
-// -------------------- Scheduler job --------------------
+// -------------------- Scheduler jobs --------------------
 Devvit.addSchedulerJob({
-  name: JOB_NAME,
+  name: JOB_NAME_NEW,
   onRun: async (_event, ctx) => {
-    console.log(`[banlist] Scheduler fired job=${JOB_NAME}`);
-    const cfg = await getCfg(ctx);
-    if (!cfg.scheduleEnabled) return;
-    await runPublish(ctx, 'cron', 'update_existing_only');
+    try {
+      await runPublish(ctx, 'cron', 'update_existing_only');
+    } catch (e: any) {
+      console.log('[banlist] cron run failed (swallowed)', e?.message ?? String(e));
+    }
   },
 });
 
-// -------------------- Triggers --------------------
+// Legacy handler to prevent "Job not found" spam from older scheduled jobs
+Devvit.addSchedulerJob({
+  name: JOB_NAME_LEGACY,
+  onRun: async (_event, ctx) => {
+    try {
+      await runPublish(ctx, 'cron', 'update_existing_only');
+    } catch (e: any) {
+      console.log('[banlist] legacy cron run failed (swallowed)', e?.message ?? String(e));
+    }
+  },
+});
+
+// -------------------- Install/Upgrade trigger (never fail install) --------------------
 Devvit.addTrigger({
   events: ['AppInstall', 'AppUpgrade'],
   onEvent: async (_event, ctx) => {
-    const cfg = await getCfg(ctx);
+    const sub = ctx.subredditName;
+    if (!sub) return;
 
-    const report: DebugReport = {
+    const snap: DebugSnapshot = {
       ts: new Date().toISOString(),
-      subreddit: ctx.subredditName!,
-      idKey: cfg.idKey,
-      actor: 'schedule_action',
-      settings: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
-      bannedUsers: { count: 0, sample: [] },
-      modlog: { fetched: 0, mapped: 0, missing: 0, sampleEntryKeys: [], sampleTargetKeys: [] },
-      modNotes: { attempts: 0, failures: 0 },
-      rows: { finalCount: 0, excludedCount: 0, truncated: false, sample: [] },
-      post: {
-        kvPostKey: kvPostKey(ctx.subredditName!, cfg.idKey),
-        storedPostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-        mode: 'update_existing_only',
-        finalActivePostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-      },
-      scheduler: {
-        kvCronKey: kvCronKey(ctx.subredditName!, cfg.idKey),
-        kvJobIdKey: kvJobIdKey(ctx.subredditName!, cfg.idKey),
-        prevCron: null,
-        prevJobId: null,
-        cancelAttempted: false,
-        scheduleAttempted: false,
-        note: [],
-      },
-      notes: [],
+      subreddit: sub,
+      idKey: 'unknown',
+      actor: 'install_or_upgrade',
+      cfg: {},
+      bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
+      rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+      post: { storedPostId: null, action: 'install', finalPostId: null },
+      scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
     };
 
-    // schedule (safe: only if needed)
-    await ensureSingleCronScheduled(ctx, cfg, report);
-    await writeDebug(ctx, cfg.idKey, report);
+    try {
+      const cfg = await getCfg(ctx);
+      snap.idKey = cfg.postIdKey;
+      snap.cfg = { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron };
 
-    // run once on install/upgrade
-    await runPublish(ctx, 'install_or_upgrade', 'update_existing_only');
+      // Best-effort schedule only; don't generate posts here.
+      await ensureSingleCronScheduled(ctx, cfg, snap);
+
+      await writeDebug(ctx, cfg.postIdKey, snap);
+    } catch (e: any) {
+      // Swallow anything so installation doesn't fail
+      snap.scheduler.error = e?.message ?? String(e);
+      snap.scheduler.note.push('install trigger error swallowed');
+      try { await writeDebug(ctx, snap.idKey === 'unknown' ? 'banned-users-list' : snap.idKey, snap); } catch {}
+      console.log('[banlist] install/upgrade failed (swallowed)', e?.message ?? String(e));
+    }
   },
 });
 
-// -------------------- Mod menu items --------------------
+// -------------------- Menu items --------------------
+
+Devvit.addMenuItem({
+  label: 'Ban List: Debug dump banned user payloads (first 10)',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, ctx) => {
+    try {
+      const cfg = await getCfg(ctx);
+      const sub = ctx.subredditName!;
+      const fetched = await fetchBannedUsers(ctx, sub, Math.min(1000, cfg.banListLimit), cfg.debugVerbose);
+
+      const banned = fetched.rows;
+      const limit = Math.min(10, banned.length);
+
+      for (let i = 0; i < limit; i++) {
+        const u = banned[i];
+        const baseRaw = (u.note || u.reason || '').trim();
+        const maybeMasked = cfg.maskUsernamesInNote ? maskUsernamesInsideNote(baseRaw) : baseRaw;
+
+        const mapped = maybeMasked
+          ? mapTextToLabel(maybeMasked, cfg.mappingRules, cfg.defaultLabel)
+          : { label: cfg.defaultLabel, matched: false };
+
+        const combinedText = `${u.note} ${u.reason}`.toLowerCase();
+        const excludedByText = cfg.excludeIfTextContains.some((needle) => needle && combinedText.includes(needle));
+        const excludedByLabel = cfg.excludeIfMappedLabelIn.some((l) => l && l === (mapped.label || cfg.defaultLabel).toLowerCase());
+
+        logBanUserDebug(
+          banned[i],
+          i,
+          { name: u.name, note: u.note, reason: u.reason, raw: baseRaw },
+          mapped,
+          { byText: excludedByText, byLabel: excludedByLabel },
+          { maskUsernamesInNote: cfg.maskUsernamesInNote }
+        );
+      }
+
+      ctx.ui.showToast(`Dumped ${limit} banned user payloads to console.`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Dump failed: ${e?.message ?? String(e)}`);
+    }
+  },
+});
+
 Devvit.addMenuItem({
   label: 'Ban List: Update active post (safe)',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const res = await runPublish(ctx, 'manual_update', 'update_existing_only');
-    if ((res as any).skipped) ctx.ui.showToast(`Skipped. Rows=${res.rows} (check debug/logs)`);
-    else ctx.ui.showToast(res.created ? `Created new post. Rows=${res.rows}` : `Updated active post. Rows=${res.rows}`);
+    try {
+      const res = await runPublish(ctx, 'manual', 'update_existing_only');
+      ctx.ui.showToast(`Done: ${res.action}. Rows=${res.rows}`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Update failed: ${e?.message ?? String(e)}`);
+    }
   },
 });
 
@@ -1115,8 +923,12 @@ Devvit.addMenuItem({
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const res = await runPublish(ctx, 'manual_create', 'create_new_and_set_active');
-    ctx.ui.showToast(`Created new active post. Rows=${res.rows}`);
+    try {
+      const res = await runPublish(ctx, 'manual', 'create_new_and_set_active');
+      ctx.ui.showToast(`Created new active post. Rows=${res.rows}`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Create failed: ${e?.message ?? String(e)}`);
+    }
   },
 });
 
@@ -1125,8 +937,12 @@ Devvit.addMenuItem({
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const res = await runPublish(ctx, 'manual_create', 'create_new_no_change_active');
-    ctx.ui.showToast(`Created post (not active). Rows=${res.rows}`);
+    try {
+      const res = await runPublish(ctx, 'manual', 'create_new_no_change_active');
+      ctx.ui.showToast(`Created post (not active). Rows=${res.rows}`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Create failed: ${e?.message ?? String(e)}`);
+    }
   },
 });
 
@@ -1135,105 +951,80 @@ Devvit.addMenuItem({
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const cfg = await getCfg(ctx);
+    try {
+      const cfg = await getCfg(ctx);
+      const sub = ctx.subredditName!;
+      const snap: DebugSnapshot = {
+        ts: new Date().toISOString(),
+        subreddit: sub,
+        idKey: cfg.postIdKey,
+        actor: 'schedule_action',
+        cfg: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
+        bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
+        rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+        post: { storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null, action: 'schedule_refresh', finalPostId: null },
+        scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
+      };
 
-    const report: DebugReport = {
-      ts: new Date().toISOString(),
-      subreddit: ctx.subredditName!,
-      idKey: cfg.idKey,
-      actor: 'schedule_action',
-      settings: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
-      bannedUsers: { count: 0, sample: [] },
-      modlog: { fetched: 0, mapped: 0, missing: 0, sampleEntryKeys: [], sampleTargetKeys: [] },
-      modNotes: { attempts: 0, failures: 0 },
-      rows: { finalCount: 0, excludedCount: 0, truncated: false, sample: [] },
-      post: {
-        kvPostKey: kvPostKey(ctx.subredditName!, cfg.idKey),
-        storedPostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-        mode: 'update_existing_only',
-        finalActivePostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-      },
-      scheduler: {
-        kvCronKey: kvCronKey(ctx.subredditName!, cfg.idKey),
-        kvJobIdKey: kvJobIdKey(ctx.subredditName!, cfg.idKey),
-        prevCron: await ctx.kvStore.get(kvCronKey(ctx.subredditName!, cfg.idKey)),
-        prevJobId: await ctx.kvStore.get(kvJobIdKey(ctx.subredditName!, cfg.idKey)),
-        cancelAttempted: false,
-        scheduleAttempted: false,
-        note: [],
-      },
-      notes: [],
-    };
+      await ensureSingleCronScheduled(ctx, cfg, snap);
+      await writeDebug(ctx, cfg.postIdKey, snap);
 
-    await ensureSingleCronScheduled(ctx, cfg, report);
-    await writeDebug(ctx, cfg.idKey, report);
-
-    if (report.scheduler.scheduleError) ctx.ui.showToast(`Schedule error: ${report.scheduler.scheduleError}`);
-    else ctx.ui.showToast(`Schedule OK (or unchanged).`);
+      if (snap.scheduler.error) ctx.ui.showToast(`Schedule error: ${snap.scheduler.error}`);
+      else ctx.ui.showToast('Schedule OK (or unchanged).');
+    } catch (e: any) {
+      ctx.ui.showToast(`Schedule refresh failed: ${e?.message ?? String(e)}`);
+    }
   },
 });
 
-// ✅ Manual purge
 Devvit.addMenuItem({
   label: 'Ban List: PURGE old crons + reschedule',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const cfg = await getCfg(ctx);
+    try {
+      const cfg = await getCfg(ctx);
+      const sub = ctx.subredditName!;
+      const snap: DebugSnapshot = {
+        ts: new Date().toISOString(),
+        subreddit: sub,
+        idKey: cfg.postIdKey,
+        actor: 'schedule_action',
+        cfg: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
+        bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
+        rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+        post: { storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null, action: 'schedule_purge', finalPostId: null },
+        scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
+      };
 
-    const report: DebugReport = {
-      ts: new Date().toISOString(),
-      subreddit: ctx.subredditName!,
-      idKey: cfg.idKey,
-      actor: 'schedule_action',
-      settings: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
-      bannedUsers: { count: 0, sample: [] },
-      modlog: { fetched: 0, mapped: 0, missing: 0, sampleEntryKeys: [], sampleTargetKeys: [] },
-      modNotes: { attempts: 0, failures: 0 },
-      rows: { finalCount: 0, excludedCount: 0, truncated: false, sample: [] },
-      post: {
-        kvPostKey: kvPostKey(ctx.subredditName!, cfg.idKey),
-        storedPostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-        mode: 'update_existing_only',
-        finalActivePostId: (await readStoredPostRef(ctx, cfg.idKey))?.postId ?? null,
-      },
-      scheduler: {
-        kvCronKey: kvCronKey(ctx.subredditName!, cfg.idKey),
-        kvJobIdKey: kvJobIdKey(ctx.subredditName!, cfg.idKey),
-        prevCron: await ctx.kvStore.get(kvCronKey(ctx.subredditName!, cfg.idKey)),
-        prevJobId: await ctx.kvStore.get(kvJobIdKey(ctx.subredditName!, cfg.idKey)),
-        cancelAttempted: false,
-        scheduleAttempted: false,
-        note: [],
-      },
-      notes: [],
-    };
+      const canceled = await purgeOldCronsAndReschedule(ctx, cfg, snap);
+      await writeDebug(ctx, cfg.postIdKey, snap);
 
-    const canceled = await purgeOldCronsAndReschedule(ctx, cfg, report);
-    await writeDebug(ctx, cfg.idKey, report);
-
-    const msg =
-      report.scheduler.scheduleError
-        ? `Purge done. Canceled ${canceled.length}. Schedule error: ${report.scheduler.scheduleError}`
-        : `Purge done. Canceled ${canceled.length}. Scheduled OK (or unchanged).`;
-
-    ctx.ui.showToast(msg);
+      if (snap.scheduler.error) ctx.ui.showToast(`Purge done. Canceled ${canceled.length}. Schedule error: ${snap.scheduler.error}`);
+      else ctx.ui.showToast(`Purge done. Canceled ${canceled.length}. Scheduled OK (or unchanged).`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Purge failed: ${e?.message ?? String(e)}`);
+    }
   },
 });
 
 Devvit.addMenuItem({
-  label: 'Ban List: Debug — print last report to logs',
+  label: 'Ban List: Debug (show last snapshot)',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    const cfg = await getCfg(ctx);
-    const dbg = await readDebug(ctx, cfg.idKey);
-    if (!dbg) {
-      ctx.ui.showToast('No debug report yet.');
-      return;
+    try {
+      const cfg = await getCfg(ctx);
+      const snap = await readDebug(ctx, cfg.postIdKey);
+      if (!snap) {
+        ctx.ui.showToast('No debug snapshot yet.');
+        return;
+      }
+      console.log('[banlist] DEBUG SNAPSHOT:\n' + JSON.stringify(snap, null, 2));
+      ctx.ui.showToast(`Debug printed. bans=${snap.bans.total} rows=${snap.rows.out}`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Debug failed: ${e?.message ?? String(e)}`);
     }
-    console.log(`[banlist] DEBUG REPORT:\n${JSON.stringify(dbg, null, 2)}`);
-    ctx.ui.showToast(`Last report ${dbg.ts} rows=${dbg.rows.finalCount} banned=${dbg.bannedUsers.count}`);
   },
 });
 
