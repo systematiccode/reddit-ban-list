@@ -1,0 +1,137 @@
+(async () => {
+  const subreddit = "PokemonGoTrade";
+  const base = `/r/${subreddit}/about/banned.json`;
+
+  let after = null;
+  let pages = 0;
+  const allChildren = [];
+
+  console.clear();
+  console.log("[ban-export] starting…", { origin: location.origin });
+
+  while (true) {
+    pages += 1;
+
+    const url = new URL(base, location.origin);
+    url.searchParams.set("limit", "100");
+    url.searchParams.set("raw_json", "1");
+    if (after) url.searchParams.set("after", after);
+
+    console.log(`[ban-export] fetching page ${pages}… after=${after || "null"}`);
+
+    const res = await fetch(url.toString(), {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${res.statusText}\n${text}`);
+    }
+
+    const json = await res.json();
+    const children = json?.data?.children ?? [];
+    const nextAfter = json?.data?.after ?? null;
+
+    allChildren.push(...children);
+
+    console.log(
+      `[ban-export] page ${pages} ok: +${children.length} (total=${allChildren.length}) nextAfter=${nextAfter}`
+    );
+
+    if (!nextAfter || children.length === 0) break;
+    after = nextAfter;
+  }
+
+  const isUSLBan = (child) => {
+    const note = (child?.note ?? "").toString().toLowerCase();
+    const banMessage = (child?.ban_message ?? "").toString().toLowerCase();
+    const modNote = (child?.mod_note ?? "").toString().toLowerCase();
+    return (
+      note.includes("usl ban:") ||
+      banMessage.includes("usl ban:") ||
+      modNote.includes("usl ban:")
+    );
+  };
+
+  const kept = [];
+  let removedCount = 0;
+
+  for (const c of allChildren) {
+    if (isUSLBan(c)) removedCount += 1;
+    else kept.push(c);
+  }
+
+  const combined = {
+    kind: "Listing",
+    data: {
+      modhash: "",
+      dist: kept.length,
+      children: kept,
+      after: null,
+      before: null,
+    },
+    meta: {
+      subreddit,
+      pagesFetched: pages,
+      fetchedAt: new Date().toISOString(),
+      source: `${location.origin}${base}`,
+      filtered: {
+        rule: 'removed if note/ban_message/mod_note contains "usl ban:" (case-insensitive)',
+        removedCount,
+        keptCount: kept.length,
+      },
+    },
+  };
+
+  const out = JSON.stringify(combined, null, 2);
+  const filename = `${subreddit}-banned-no-usl.json`;
+
+  console.log(`[ban-export] done ✅ users=${kept.length} removedUSL=${removedCount} pages=${pages}`);
+
+  // 1) Try clipboard (best fallback)
+  try {
+    await navigator.clipboard.writeText(out);
+    console.log("[ban-export] copied JSON to clipboard");
+  } catch (e) {
+    console.warn("[ban-export] clipboard copy blocked (ok)", e);
+  }
+
+  // 2) Try download
+  let downloaded = false;
+  try {
+    const blob = new Blob([out], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+
+    // some browsers require a user gesture; this can still fail silently
+    a.click();
+
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 2000);
+
+    downloaded = true;
+    console.log(`[ban-export] attempted download: ${filename}`);
+  } catch (e) {
+    console.warn("[ban-export] download blocked (ok)", e);
+  }
+
+  // 3) If no download, open in a new tab so you can Save As
+  if (!downloaded) {
+    const blob = new Blob([out], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    console.log("[ban-export] opened JSON in a new tab (use Save As)");
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  alert(`Done.\nKept: ${kept.length}\nRemoved USL: ${removedCount}\n\nIf no file downloaded, the JSON is in your clipboard and/or opened in a new tab.`);
+})().catch((e) => {
+  console.error("[ban-export] failed ❌", e);
+  alert(`Failed: ${e?.message || e}`);
+});

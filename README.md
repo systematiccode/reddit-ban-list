@@ -1,145 +1,155 @@
-# Ban List Post (Auto‑Updated)
+# Ban List DB -- Auto-Managed & Auto-Posted
 
-This app maintains a single subreddit post that lists **recently banned users** in a clean, readable format.  
-It is intended for communities that want a **public, always-up-to-date ban list** (or a mod-only maintained post) without manual editing.
+This app maintains a **database-driven ban list** for your subreddit and
+automatically publishes a clean, formatted post from that database.
 
-The app:
-- Fetches the current ban list (up to a configurable limit)
-- Optionally pulls ban reasons from modlog and/or mod notes
-- Formats the output as a **table** or **bulleted list**
-- Updates an “active” post on a schedule, or on demand via mod menu actions
+Unlike simple ban scrapers, this app:
 
----
+-   Maintains a persistent KV database of banned users\
+-   Updates in real time via ModAction triggers\
+-   Uses **modlog (primary)** for ban reasons\
+-   Ignores temporary bans\
+-   Supports manual backlog import\
+-   Publishes from DB only (no full rebuild each run)\
+-   Supports scheduled updates and manual publishing\
+-   Allows configurable mapping, filtering, and footer
+
+------------------------------------------------------------------------
 
 ## How It Works
 
-- The app tracks an **active post** using a configurable key (`postIdKey`) stored per-subreddit.
-- On each run, it rebuilds the ban list and updates the active post **if it is editable**.
-- If the active post is not editable (locked/archived/removed/insufficient perms), the app follows the configured **fallback policy** (do nothing or create a new post).
+### Real-Time Monitoring
 
----
+The app listens to moderator actions:
 
-## Moderator Menu Actions
+-   `banuser`
+-   `unbanuser`
 
-These actions appear under the subreddit mod tools menu:
+On permanent ban: - Fetches modlog entry - Confirms it is permanent -
+Extracts reason from modlog description - Applies mapping & filters -
+Saves to database
 
-- **Ban List: Update active post (safe)**  
-  Updates the active post only. If it can’t be edited, follows the manual-update fallback setting.
+On unban: - Removes user from database
 
-- **Ban List: Create NEW post (set active)**  
-  Creates a new ban list post and makes it the active post.
+Temporary bans are ignored.
 
-- **Ban List: Create NEW post (do NOT set active)**  
-  Creates a new ban list post but keeps the current active post unchanged.
+------------------------------------------------------------------------
 
-- **Ban List: Refresh schedule (only if needed)**  
-  Ensures the scheduled job matches the current cron setting.
+## Database Design
 
-- **Ban List: PURGE old crons + reschedule**  
-  Clears stored schedule metadata and recreates the scheduled job.
+Each subreddit has its own KV database:
 
-- **Ban List: Debug — print last report to logs**  
-  Prints the last internal run report (only useful when troubleshooting).
+-   Index of usernames\
+-   Individual user records containing:
+    -   Username
+    -   Normalized reason
+    -   Raw reason
+    -   Last updated timestamp
 
----
+The published post is generated strictly from this database.
 
-## Configuration (Devvit Settings)
+------------------------------------------------------------------------
 
-### Post & Storage
-- **Post title (`postTitle`)**  
-  Title used when creating a new ban list post.
+## Reason Resolution
 
-- **Post key (`postIdKey`)**  
-  Storage key that identifies which post is considered “active” for updates in this subreddit.
+When a ban occurs:
 
-### Auto‑Update Schedule
-- **Enable auto-update schedule (`scheduleEnabled`)**  
-  Turns scheduled updates on/off.
+1.  **Modlog is checked first**
+    -   `type = banuser`
+    -   `details` determines permanent vs temporary
+    -   `description` is used as raw reason
+2.  **Mod notes are used only as fallback** (if modlog description is
+    empty)
 
-- **Auto-update cron (UNIX cron) (`scheduleCron`)**  
-  Cron expression for how often to run updates.  
-  Default is `*/2 * * * *` (every 2 minutes).
+------------------------------------------------------------------------
 
-### Fallback Behavior (When Active Post Can’t Be Edited)
-- **CRON fallback (`fallbackOnUneditable_cron`)**  
-  What to do during scheduled runs when the active post is uneditable:  
-  - `do_nothing` (default)  
-  - `create_new`
+## Publishing Behavior
 
-- **MANUAL UPDATE fallback (`fallbackOnUneditable_manualUpdate`)**  
-  What to do when a moderator triggers “Update active post” and it’s uneditable:  
-  - `do_nothing`  
-  - `create_new` (default)
+The post is generated from the database:
 
-- **Set new post as active (`setNewPostAsActive`)**  
-  When fallback creates a new post, sets it as the active post.
+-   Applies optional "mapped-only" filter
+-   Sorts (by reason or username)
+-   Builds markdown table
+-   Updates existing post if editable
+-   Creates fallback post if configured
+-   Optional scheduled updates via cron
 
-### Ban Reason Source
-- **Reason source (`reasonSource`)**  
-  Where the displayed “reason” is pulled from:  
-  - `modlog_banuser`  
-  - `mod_note`  
-  - `modlog_then_modnote`
+The post respects Reddit's size limits and truncates safely.
 
-### Mapping (Categorization)
-- **Mapping rules JSON (`mappingJson`)**  
-  JSON array that maps keywords found in reasons/notes to a category label.
-  Example shape:
-  ```json
-  [
-    { "label": "Scamming", "keywords": ["scam", "scammer"] },
-    { "label": "Harassment/Discrimination", "keywords": ["harass", "slur"] }
-  ]
-  ```
+------------------------------------------------------------------------
 
-- **Default category label (`defaultLabel`)**  
-  Used when no mapping rule matches.
+## Settings Overview
 
-### Output Format
-- **Show category column (`showCategory`)**  
-  Adds a category column (based on mapping).
+### Posting
 
-- **Show ban reason/rule column (`showReason`)**  
-  Shows the reason text column.
+-   Post title
+-   Post key
+-   Max rows in post
+-   Sort order
+-   Only include mapped reasons (optional)
 
-- **Output mode (`outputMode`)**  
-  - `table` (default)  
-  - `bullets`
+### Scheduler
 
-- **Apply mapping to reason prefix (`applyMappingToReasonPrefix`)**  
-  If enabled, attempts to rewrite the reason prefix using the mapped label.
+-   Enable/disable schedule
+-   Cron expression
+-   Create new post if edit fails
+-   Set new post as active
 
-- **Only replace reason prefix if mapped (`reasonPrefixOnlyIfMapped`)**  
-  When rewriting prefixes, only changes them when a mapping match occurred; otherwise keeps the original reason.
+### Mapping & Filtering
 
-- **Sort order (`sortOrder`)**  
-  - `username_asc` (default)  
-  - `username_desc`
+-   Exclude if text contains
+-   Exclude if mapped label matches
+-   Mapping rules JSON
+-   Default label
 
-### Filters & Limits
-- **Exclude if reason contains (`excludeIfReasonContains`)**  
-  Comma-separated phrases. If the reason contains any of these (case-insensitive), that user is excluded from the post.
+### Footer
 
-- **How many mod notes to fetch per user (`modNotesPerUser`)**  
-  Controls how many notes are checked per user when using mod-note sources.
+-   Enable footer
+-   Custom footer text
+-   Optional footer link
+-   Custom link label
 
-- **How many modlog entries to scan (`modlogLookbackLimit`)**  
-  Controls the scan depth for finding relevant ban reasons in modlog.
+### Reason Sources
 
-- **Max banned users to list (`banListLimit`)**  
-  Limits how many banned users are included (up to 1000).
-
-- **Max rows to include in the post (`maxRowsInPost`)**  
-  Extra safety cap to avoid Reddit post size limits.
+-   Modlog lookup limit
+-   Modlog match time window
+-   Mod notes lookup limit
 
 ### Debug
-- **Verbose logs (`debugVerbose`)**  
-  Enables additional troubleshooting output. Turn off for quieter logs.
 
----
+-   Verbose logging
 
-## Notes
+------------------------------------------------------------------------
 
-- This app does **not** change ban status or apply bans.  
-  It only **publishes a list** based on the subreddit’s ban list and configured reason sources.
-- If your active post becomes locked/archived, set an appropriate fallback policy (create a new post vs do nothing).
+## Moderator Tools
+
+The app provides moderator menu actions:
+
+-   Import backlog JSON (manual DB fill)
+-   Clear entire ban database
+-   Update active post
+-   Create new post (set active)
+-   Create new post (do not set active)
+-   Refresh schedule
+-   View debug snapshot
+
+------------------------------------------------------------------------
+
+## Important Notes
+
+-   The app does not create or modify bans.
+-   Only permanent bans are stored.
+-   Unbans immediately remove users from the database.
+-   The published post reflects the internal DB, not a live API scrape.
+
+------------------------------------------------------------------------
+
+## Designed For
+
+Communities that want:
+
+-   Transparent ban visibility\
+-   Categorized ban reasons\
+-   Automatic maintenance\
+-   Controlled formatting\
+-   Database-backed reliability

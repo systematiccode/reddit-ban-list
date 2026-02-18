@@ -123,72 +123,68 @@ type DebugSnapshot = {
 };
 
 Devvit.addSettings([
-  { type: 'string', name: 'postTitle', label: 'Post title', defaultValue: 'Banned Users List (Auto-updated)' },
-  { type: 'string', name: 'postIdKey', label: 'Post key (tracks which post to update)', defaultValue: 'banned-users-list' },
-
-  { type: 'boolean', name: 'postScheduleEnabled', label: 'Enable post update schedule', defaultValue: true },
-  { type: 'string', name: 'postScheduleCron', label: 'Post update cron (UNIX cron)', defaultValue: '*/30 * * * *' },
-
-  { type: 'number', name: 'maxRowsInPost', label: 'Max rows in post (avoid size limits)', defaultValue: 2000 },
-
-  { type: 'string', name: 'excludeIfTextContains', label: 'Exclude if text contains (comma-separated, case-insensitive)', defaultValue: 'usl ban:,usl ban from,usl ban' },
-  { type: 'string', name: 'excludeIfMappedLabelIn', label: 'Exclude if mapped label is (comma-separated, case-insensitive)', defaultValue: 'USL Ban' },
-
   {
-    type: 'string',
-    name: 'mappingJson',
-    label: 'Mapping rules JSON (substring match)',
-    defaultValue: JSON.stringify(
-      [
-        { label: 'Ban Evasion', keywords: ['ban evasion'] },
-        {
-          label: 'Harassment, Bullying or Discrimination',
-          keywords: [
-            'behaviour',
-            'no harassment',
-            'harassment',
-            'bully',
-            'discrimination',
-            'dox',
-            'doxx',
-            'doxxing',
-            'slur',
-            'racist',
-            'homophobic',
-            'transphobic',
-            'sexist',
-          ],
-        },
-        { label: 'Scamming', keywords: ['scamming', 'scam', 'scammer', '#scammer', 'fraud'] },
-        { label: 'Selling of accounts, Pokémon, or services', keywords: ['selling', 'buying', 'advertising', 'service', 'services', 'coins', 'pilot', 'boost'] },
-        { label: 'Threatening, harassing, or inciting violence', keywords: ['threat', 'threatening', 'inciting violence', 'violence'] },
-        { label: 'Spamming', keywords: ['spam', 'no spam', 'posting frequency', 'off-topic', 'advert'] },
-        { label: 'USL Ban', keywords: ['usl ban'] },
-      ],
-      null,
-      2
-    ),
+    type: 'group',
+    label: 'Posting',
+    fields: [
+      { type: 'string', name: 'postTitle', label: 'Post title', defaultValue: 'Banned Users List (Auto-updated)' },
+      { type: 'string', name: 'postIdKey', label: 'Post key (tracks which post to update)', defaultValue: 'banned-users-list' },
+      { type: 'number', name: 'maxRowsInPost', label: 'Max rows in post (avoid size limits)', defaultValue: 2000 },
+      { type: 'string', name: 'sortBy', label: 'Sort: "reason_asc" or "user_asc"', defaultValue: 'reason_asc' },
+      { type: 'boolean', name: 'postOnlyMappedReasons', label: 'Only include mapped reasons (exclude default/unmapped)', defaultValue: false },
+    ],
   },
 
-  { type: 'string', name: 'defaultLabel', label: 'Default label if no mapping match / empty', defaultValue: 'Banned' },
+  {
+    type: 'group',
+    label: 'Scheduler',
+    fields: [
+      { type: 'boolean', name: 'postScheduleEnabled', label: 'Enable post update schedule', defaultValue: true },
+      { type: 'string', name: 'postScheduleCron', label: 'Post update cron (UNIX cron)', defaultValue: '*/30 * * * *' },
+      { type: 'boolean', name: 'createNewOnEditFail', label: 'If editing active post fails, create a new post', defaultValue: true },
+      { type: 'boolean', name: 'setNewPostAsActive', label: 'When creating a new post, set it as active', defaultValue: true },
+    ],
+  },
 
-  { type: 'string', name: 'sortBy', label: 'Sort: "reason_asc" or "user_asc"', defaultValue: 'reason_asc' },
+  {
+    type: 'group',
+    label: 'Mapping & Filtering',
+    fields: [
+      { type: 'string', name: 'excludeIfTextContains', label: 'Exclude if text contains', defaultValue: 'usl ban:,usl ban from,usl ban' },
+      { type: 'string', name: 'excludeIfMappedLabelIn', label: 'Exclude if mapped label is', defaultValue: 'USL Ban' },
+      { type: 'string', name: 'mappingJson', label: 'Mapping rules JSON', defaultValue: '[]' },
+      { type: 'string', name: 'defaultLabel', label: 'Default label if no mapping match', defaultValue: 'Banned' },
+    ],
+  },
 
-  { type: 'boolean', name: 'createNewOnEditFail', label: 'If editing active post fails, create a new post', defaultValue: true },
-  { type: 'boolean', name: 'setNewPostAsActive', label: 'When creating a new post, set it as active', defaultValue: true },
+  {
+    type: 'group',
+    label: 'Footer',
+    fields: [
+      { type: 'boolean', name: 'footerEnabled', label: 'Enable footer note', defaultValue: true },
+      { type: 'string', name: 'footerText', label: 'Footer text (markdown allowed)', defaultValue: 'If any issues with bot contact u/raypogo. If any issues with ban list, contact the mods.' },
+      { type: 'string', name: 'footerLink', label: 'Footer link (optional)', defaultValue: '' },
+      { type: 'string', name: 'footerLinkLabel', label: 'Footer link label (optional)', defaultValue: 'More info' },
+    ],
+  },
 
-  { type: 'boolean', name: 'debugVerbose', label: 'Verbose logs', defaultValue: true },
+  {
+    type: 'group',
+    label: 'Reason Sources',
+    fields: [
+      { type: 'number', name: 'modLogLookupLimit', label: 'Modlog lookup limit per ban', defaultValue: 50 },
+      { type: 'number', name: 'modLogMatchWindowSeconds', label: 'Modlog match time window (seconds)', defaultValue: 600 },
+      { type: 'number', name: 'modNotesLookupLimit', label: 'Mod notes lookup limit per ban', defaultValue: 5 },
+    ],
+  },
 
-  { type: 'number', name: 'modLogLookupLimit', label: 'Modlog lookup limit per ban (1–100)', defaultValue: 50 },
-  { type: 'number', name: 'modLogMatchWindowSeconds', label: 'Modlog match time window (seconds)', defaultValue: 600 },
-
-  { type: 'number', name: 'modNotesLookupLimit', label: 'Mod notes lookup limit per ban (1–25)', defaultValue: 5 },
-
-  { type: 'boolean', name: 'footerEnabled', label: 'Enable footer note', defaultValue: true },
-  { type: 'string', name: 'footerText', label: 'Footer text (markdown allowed)', defaultValue: 'If any issues with bot contact u/raypogo. If any issues with ban list, contact the mods.' },
-  { type: 'string', name: 'footerLink', label: 'Footer link (optional)', defaultValue: '' },
-  { type: 'string', name: 'footerLinkLabel', label: 'Footer link label (optional)', defaultValue: 'More info' },
-  { type: 'boolean', name: 'postOnlyMappedReasons', label: 'Posting: only include mapped reasons (exclude default/unmapped)', defaultValue: false },
+  {
+    type: 'group',
+    label: 'Debug',
+    fields: [
+      { type: 'boolean', name: 'debugVerbose', label: 'Verbose logs', defaultValue: true },
+    ],
+  },
 ]);
 
 function parseCsvLower(v: string): string[] {
