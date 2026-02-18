@@ -1,166 +1,182 @@
 import { Devvit, Context, RedditAPIClient } from '@devvit/public-api';
 
-/**
- * Banned List Poster — "Simple but Full‑Featured"
- *
- * ✅ Uses ONLY /about/banned listing via ctx.reddit.getBannedUsers (no modlog, no modnotes)
- * ✅ Extracts NOTE + REASON defensively (supports u.data nesting + multiple key aliases)
- * ✅ Mapping -> short labels (configurable JSON)
- * ✅ Exclusions (configurable):
- *    - excludeIfTextContains (needle match across raw note+reason)
- *    - excludeIfMappedLabelIn (label match after mapping)
- *
- * ✅ Full mod tooling UX retained:
- *    - Update active post (safe)
- *    - Create NEW post (set active)
- *    - Create NEW post (do NOT set active)
- *    - Refresh schedule (only if needed)
- *    - PURGE old crons + reschedule (best effort)
- *
- * ✅ Scheduler:
- *    - New job name + legacy job name supported (avoids "Job not found")
- *    - Stored jobId + cron in KV to avoid cron limits
- *
- * ✅ Install/Upgrade:
- *    - Best-effort schedule only, never fails installation
- */
+const JOB_POST = 'banlist_post_update';
+const JOB_POST_LEGACY = 'simple_banned_list_update';
 
-const JOB_NAME_NEW = 'simple_banned_list_update';
-const JOB_NAME_LEGACY = 'update_banned_list_post'; // absorb old scheduled jobs safely
+const KV_POST_PREFIX = 'banlist_post:';
+const KV_CRON_PREFIX = 'banlist_cron:';
+const KV_JOBID_PREFIX = 'banlist_jobid:';
+const KV_DEBUG_PREFIX = 'banlist_debug:';
 
-// KV keys
-const KV_POST_PREFIX = 'banlist_post:';     // active post ref
-const KV_CRON_PREFIX = 'banlist_cron:';     // stored cron string
-const KV_JOBID_PREFIX = 'banlist_jobid:';   // stored scheduler jobId
-const KV_DEBUG_PREFIX = 'banlist_debug:';   // debug snapshot
+const KV_DB_INDEX_PREFIX = 'banlist_db_index:';
+const KV_DB_USER_PREFIX = 'banlist_db_user:';
+const KV_IMPORT_STATUS_PREFIX = 'banlist_import_status:';
+
+type ModNoteType =
+  | 'BAN'
+  | 'NOTE'
+  | 'APPROVAL'
+  | 'REMOVAL'
+  | 'MUTE'
+  | 'INVITE'
+  | 'SPAM'
+  | 'CONTENT_CHANGE'
+  | 'MOD_ACTION'
+  | 'ALL';
 
 type MappingRule = { label: string; keywords: string[] };
-
-type OutputSort = 'note_asc' | 'user_asc';
+type OutputSort = 'reason_asc' | 'user_asc';
 
 type Config = {
   postTitle: string;
   postIdKey: string;
 
-  scheduleEnabled: boolean;
-  scheduleCron: string;
+  postScheduleEnabled: boolean;
+  postScheduleCron: string;
 
-  banListLimit: number;
   maxRowsInPost: number;
 
-  // Exclusions
-  excludeIfTextContains: string[];   // needles, lowercase
-  excludeIfMappedLabelIn: string[];  // labels, lowercase
+  excludeIfTextContains: string[];
+  excludeIfMappedLabelIn: string[];
 
-  // Mapping
   mappingRules: MappingRule[];
   defaultLabel: string;
 
-  // Formatting
-  maskUsernamesInNote: boolean;
   sortBy: OutputSort;
 
-  // Behavior
   createNewOnEditFail: boolean;
   setNewPostAsActive: boolean;
 
-  // Debug
   debugVerbose: boolean;
+
+  modLogLookupLimit: number;
+  modLogMatchWindowSeconds: number;
+
+  modNotesLookupLimit: number;
 };
 
 type StoredPostRef = { postId: string; updatedAt: string; idKey: string };
 
-type BannedListingRow = {
-  name: string;   // username, no "u/"
-  note: string;   // NOTE column
-  reason: string; // REASON column
-  raw: string;    // note||reason
+type BanRecord = {
+  u: string;
+  reason: string;
+  raw?: string;
+  updatedAt: string;
 };
 
-type RunMode = 'update_existing_only' | 'create_new_and_set_active' | 'create_new_no_change_active';
+type ImportStatus = {
+  lastImportedAt?: string;
+  lastImportedUser?: string;
+  totalImported?: number;
+  totalSkipped?: number;
+  lastChunkTotal?: number;
+  lastChunkImported?: number;
+  lastChunkSkipped?: number;
+};
 
 type DebugSnapshot = {
   ts: string;
   subreddit: string;
   idKey: string;
-  actor: 'cron' | 'manual' | 'install_or_upgrade' | 'schedule_action';
+  actor:
+    | 'cron_post'
+    | 'manual_post'
+    | 'install_or_upgrade'
+    | 'schedule_action'
+    | 'import'
+    | 'db_clear'
+    | 'mod_action';
   cfg: Record<string, any>;
-  bans: { total: number; sample: any[]; sampleKeys: string[]; sampleDataKeys: string[] };
-  rows: { out: number; excludedByText: number; excludedByLabel: number; sample: Array<{ u: string; raw: string; label: string }> };
-  post: { storedPostId?: string | null; action: string; finalPostId?: string | null; error?: string };
-  scheduler: { note: string[]; prevCron?: string | null; prevJobId?: string | null; newJobId?: string | null; error?: string | null };
+  db: { total: number; sample: Array<{ u: string; reason: string }> };
+  import?: ImportStatus;
+  modAction: {
+    action?: string | null;
+    targetUser?: string | null;
+    isPermanent?: boolean | null;
+    raw?: string | null;
+    mapped?: string | null;
+    skippedByText?: boolean;
+    skippedByLabel?: boolean;
+    note: string[];
+    error?: string | null;
+  };
+  post: {
+    storedPostId?: string | null;
+    action: string;
+    finalPostId?: string | null;
+    error?: string;
+  };
+  scheduler: {
+    note: string[];
+    prevCron?: string | null;
+    prevJobId?: string | null;
+    newJobId?: string | null;
+    error?: string | null;
+  };
 };
 
-// -------------------- Settings --------------------
 Devvit.addSettings([
   { type: 'string', name: 'postTitle', label: 'Post title', defaultValue: 'Banned Users List (Auto-updated)' },
   { type: 'string', name: 'postIdKey', label: 'Post key (tracks which post to update)', defaultValue: 'banned-users-list' },
 
-  { type: 'boolean', name: 'scheduleEnabled', label: 'Enable auto-update schedule', defaultValue: true },
-  { type: 'string', name: 'scheduleCron', label: 'Auto-update cron (UNIX cron)', defaultValue: '*/30 * * * *' },
+  { type: 'boolean', name: 'postScheduleEnabled', label: 'Enable post update schedule', defaultValue: true },
+  { type: 'string', name: 'postScheduleCron', label: 'Post update cron (UNIX cron)', defaultValue: '*/30 * * * *' },
 
-  { type: 'number', name: 'banListLimit', label: 'Max banned users to list (up to 1000)', defaultValue: 1000 },
-  { type: 'number', name: 'maxRowsInPost', label: 'Max rows in post (avoid size limits)', defaultValue: 1000 },
+  { type: 'number', name: 'maxRowsInPost', label: 'Max rows in post (avoid size limits)', defaultValue: 2000 },
 
-  // Exclusion controls (fully configurable)
   { type: 'string', name: 'excludeIfTextContains', label: 'Exclude if text contains (comma-separated, case-insensitive)', defaultValue: 'usl ban:,usl ban from,usl ban' },
   { type: 'string', name: 'excludeIfMappedLabelIn', label: 'Exclude if mapped label is (comma-separated, case-insensitive)', defaultValue: 'USL Ban' },
 
-  // Mapping rules (JSON)
   {
     type: 'string',
     name: 'mappingJson',
-    label: 'Mapping rules JSON (maps note/reason text to short labels)',
+    label: 'Mapping rules JSON (substring match)',
     defaultValue: JSON.stringify(
       [
         { label: 'Ban Evasion', keywords: ['ban evasion'] },
-        { label: 'Harassment, Bullying or Discrimination', keywords: ['behaviour', 'no harassment', 'harassment', 'bully', 'discrimination', 'dox', 'doxx', 'doxxing', 'slur', 'racist', 'homophobic', 'transphobic', 'sexist', 'nude', 'nudes'] },
+        {
+          label: 'Harassment, Bullying or Discrimination',
+          keywords: [
+            'behaviour',
+            'no harassment',
+            'harassment',
+            'bully',
+            'discrimination',
+            'dox',
+            'doxx',
+            'doxxing',
+            'slur',
+            'racist',
+            'homophobic',
+            'transphobic',
+            'sexist',
+          ],
+        },
         { label: 'Scamming', keywords: ['scamming', 'scam', 'scammer', '#scammer', 'fraud'] },
-        { label: 'Selling of accounts, Pokémon, or services', keywords: ['selling', 'buying', 'advertising', 'service', 'services', 'coins', 'raid service', 'pilot', 'boost'] },
+        { label: 'Selling of accounts, Pokémon, or services', keywords: ['selling', 'buying', 'advertising', 'service', 'services', 'coins', 'pilot', 'boost'] },
         { label: 'Threatening, harassing, or inciting violence', keywords: ['threat', 'threatening', 'inciting violence', 'violence'] },
         { label: 'Spamming', keywords: ['spam', 'no spam', 'posting frequency', 'off-topic', 'advert'] },
-
-        // Optional: map USL explicitly so label-exclusion can hide it cleanly
         { label: 'USL Ban', keywords: ['usl ban'] },
       ],
       null,
       2
     ),
   },
-  { type: 'string', name: 'defaultLabel', label: 'Default label if no mapping match / empty', defaultValue: 'No reason provided' },
 
-  // Formatting
-  { type: 'boolean', name: 'maskUsernamesInNote', label: 'Mask usernames inside note (u/******)', defaultValue: true },
-  { type: 'string', name: 'sortBy', label: 'Sort: "note_asc" or "user_asc"', defaultValue: 'note_asc' },
+  { type: 'string', name: 'defaultLabel', label: 'Default label if no mapping match / empty', defaultValue: 'Banned' },
 
-  // Behavior
+  { type: 'string', name: 'sortBy', label: 'Sort: "reason_asc" or "user_asc"', defaultValue: 'reason_asc' },
+
   { type: 'boolean', name: 'createNewOnEditFail', label: 'If editing active post fails, create a new post', defaultValue: true },
   { type: 'boolean', name: 'setNewPostAsActive', label: 'When creating a new post, set it as active', defaultValue: true },
 
-  // Debug
   { type: 'boolean', name: 'debugVerbose', label: 'Verbose logs', defaultValue: true },
-]);
 
-// -------------------- Helpers: parsing --------------------
-function userToPlain(u: any): any {
-  if (!u) return u;
-  try {
-    if (typeof u.toJSON === 'function') return u.toJSON();
-  } catch {}
-  const out: any = {};
-  const fields = [
-    'id','username','createdAt','linkKarma','commentKarma','nsfw','isAdmin','modPermissions',
-    'url','permalink','hasVerifiedEmail','displayName','about'
-  ];
-  for (const f of fields) {
-    try { out[f] = (u as any)[f]; } catch {}
-  }
-  // Include any enumerable own props too
-  try {
-    for (const k of Object.keys(u)) out[k] = (u as any)[k];
-  } catch {}
-  return out;
-}
+  { type: 'number', name: 'modLogLookupLimit', label: 'Modlog lookup limit per ban (1–100)', defaultValue: 50 },
+  { type: 'number', name: 'modLogMatchWindowSeconds', label: 'Modlog match time window (seconds)', defaultValue: 600 },
+
+  { type: 'number', name: 'modNotesLookupLimit', label: 'Mod notes lookup limit per ban (1–25)', defaultValue: 5 },
+]);
 
 function parseCsvLower(v: string): string[] {
   return String(v ?? '')
@@ -190,11 +206,10 @@ async function getCfg(ctx: Context): Promise<Config> {
   const postTitle = String((await ctx.settings.get('postTitle')) ?? 'Banned Users List (Auto-updated)');
   const postIdKey = String((await ctx.settings.get('postIdKey')) ?? 'banned-users-list');
 
-  const scheduleEnabled = Boolean(await ctx.settings.get('scheduleEnabled'));
-  const scheduleCron = String((await ctx.settings.get('scheduleCron')) ?? '*/30 * * * *');
+  const postScheduleEnabled = Boolean(await ctx.settings.get('postScheduleEnabled'));
+  const postScheduleCron = String((await ctx.settings.get('postScheduleCron')) ?? '*/30 * * * *');
 
-  const banListLimit = Math.min(1000, Math.max(1, Number((await ctx.settings.get('banListLimit')) ?? 1000) || 1000));
-  const maxRowsInPost = Math.min(2000, Math.max(1, Number((await ctx.settings.get('maxRowsInPost')) ?? 1000) || 1000));
+  const maxRowsInPost = Math.min(5000, Math.max(1, Number((await ctx.settings.get('maxRowsInPost')) ?? 2000) || 2000));
 
   const excludeIfTextContains = parseCsvLower(String((await ctx.settings.get('excludeIfTextContains')) ?? ''));
   const excludeIfMappedLabelIn = parseCsvLower(String((await ctx.settings.get('excludeIfMappedLabelIn')) ?? ''));
@@ -202,51 +217,80 @@ async function getCfg(ctx: Context): Promise<Config> {
   const mappingJson = String((await ctx.settings.get('mappingJson')) ?? '[]');
   const mappingRules = safeParseMappings(mappingJson);
 
-  const defaultLabel = String((await ctx.settings.get('defaultLabel')) ?? 'No reason provided').trim() || 'No reason provided';
+  const defaultLabel = String((await ctx.settings.get('defaultLabel')) ?? 'Banned').trim() || 'Banned';
 
-  const maskUsernamesInNote = Boolean(await ctx.settings.get('maskUsernamesInNote'));
-  const sortByRaw = String((await ctx.settings.get('sortBy')) ?? 'note_asc').trim().toLowerCase();
-  const sortBy: OutputSort = sortByRaw === 'user_asc' ? 'user_asc' : 'note_asc';
+  const sortByRaw = String((await ctx.settings.get('sortBy')) ?? 'reason_asc').trim().toLowerCase();
+  const sortBy: OutputSort = sortByRaw === 'user_asc' ? 'user_asc' : 'reason_asc';
 
   const createNewOnEditFail = Boolean(await ctx.settings.get('createNewOnEditFail'));
   const setNewPostAsActive = Boolean(await ctx.settings.get('setNewPostAsActive'));
 
   const debugVerbose = Boolean(await ctx.settings.get('debugVerbose'));
 
+  const modLogLookupLimit = Math.min(100, Math.max(1, Number((await ctx.settings.get('modLogLookupLimit')) ?? 50) || 50));
+  const modLogMatchWindowSeconds = Math.min(3600, Math.max(30, Number((await ctx.settings.get('modLogMatchWindowSeconds')) ?? 600) || 600));
+  const modNotesLookupLimit = Math.min(25, Math.max(1, Number((await ctx.settings.get('modNotesLookupLimit')) ?? 5) || 5));
+
   return {
     postTitle,
     postIdKey,
-    scheduleEnabled,
-    scheduleCron,
-    banListLimit,
+    postScheduleEnabled,
+    postScheduleCron,
     maxRowsInPost,
     excludeIfTextContains,
     excludeIfMappedLabelIn,
     mappingRules,
     defaultLabel,
-    maskUsernamesInNote,
     sortBy,
     createNewOnEditFail,
     setNewPostAsActive,
     debugVerbose,
+    modLogLookupLimit,
+    modLogMatchWindowSeconds,
+    modNotesLookupLimit,
   };
 }
 
-// -------------------- Helpers: KV keys --------------------
 function kvPostKey(sub: string, idKey: string): string {
   return `${KV_POST_PREFIX}${sub}:${idKey}`;
 }
 function kvCronKey(sub: string, idKey: string): string {
-  return `${KV_CRON_PREFIX}${sub}:${idKey}`;
+  return `${KV_CRON_PREFIX}${sub}:${idKey}:post`;
 }
 function kvJobIdKey(sub: string, idKey: string): string {
-  return `${KV_JOBID_PREFIX}${sub}:${idKey}`;
+  return `${KV_JOBID_PREFIX}${sub}:${idKey}:post`;
 }
 function kvDebugKey(sub: string, idKey: string): string {
   return `${KV_DEBUG_PREFIX}${sub}:${idKey}`;
 }
+function kvDbIndexKey(sub: string): string {
+  return `${KV_DB_INDEX_PREFIX}${sub}`;
+}
+function kvDbUserKey(sub: string, uLower: string): string {
+  return `${KV_DB_USER_PREFIX}${sub}:${uLower}`;
+}
+function kvImportStatusKey(sub: string): string {
+  return `${KV_IMPORT_STATUS_PREFIX}${sub}`;
+}
 
-// -------------------- Helpers: KV read/write --------------------
+async function writeDebug(ctx: Context, idKey: string, snap: DebugSnapshot): Promise<void> {
+  const sub = ctx.subredditName!;
+  try {
+    await ctx.kvStore.put(kvDebugKey(sub, idKey), JSON.stringify(snap, null, 2));
+  } catch {}
+}
+
+async function readDebug(ctx: Context, idKey: string): Promise<DebugSnapshot | null> {
+  const sub = ctx.subredditName!;
+  try {
+    const raw = await ctx.kvStore.get(kvDebugKey(sub, idKey));
+    if (!raw) return null;
+    return JSON.parse(raw) as DebugSnapshot;
+  } catch {
+    return null;
+  }
+}
+
 async function readStoredPostRef(ctx: Context, idKey: string): Promise<StoredPostRef | null> {
   const sub = ctx.subredditName!;
   const raw = await ctx.kvStore.get(kvPostKey(sub, idKey));
@@ -264,29 +308,12 @@ async function writeStoredPostRef(ctx: Context, idKey: string, postId: string): 
   await ctx.kvStore.put(kvPostKey(sub, idKey), JSON.stringify(value));
 }
 
-async function writeDebug(ctx: Context, idKey: string, snap: DebugSnapshot): Promise<void> {
-  const sub = ctx.subredditName!;
-  try {
-    await ctx.kvStore.put(kvDebugKey(sub, idKey), JSON.stringify(snap, null, 2));
-  } catch {
-    // ignore
-  }
-}
-
-async function readDebug(ctx: Context, idKey: string): Promise<DebugSnapshot | null> {
-  const sub = ctx.subredditName!;
-  try {
-    const raw = await ctx.kvStore.get(kvDebugKey(sub, idKey));
-    if (!raw) return null;
-    return JSON.parse(raw) as DebugSnapshot;
-  } catch {
-    return null;
-  }
-}
-
-// -------------------- Mapping + formatting --------------------
-function maskUsernamesInsideNote(noteRaw: string): string {
-  return String(noteRaw ?? '').replace(/u\/\S+/g, 'u/******');
+function escapeMd(s: string): string {
+  return String(s ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\|/g, '\\|')
+    .trim();
 }
 
 function mapTextToLabel(text: string, rules: MappingRule[], defaultLabel: string): { label: string; matched: boolean } {
@@ -297,31 +324,195 @@ function mapTextToLabel(text: string, rules: MappingRule[], defaultLabel: string
   return { label: defaultLabel, matched: false };
 }
 
-function escapeMd(s: string): string {
-  return String(s ?? '')
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .replace(/\|/g, '\\|')
-    .trim();
+function normalizeReason(
+  raw: string,
+  cfg: Config
+): { reason: string; skippedByText: boolean; skippedByLabel: boolean; mappedLabel: string } {
+  const rawText = String(raw ?? '').trim();
+  const combinedLower = rawText.toLowerCase();
+
+  const skippedByText = cfg.excludeIfTextContains.some((needle) => needle && combinedLower.includes(needle));
+  if (skippedByText) return { reason: '', skippedByText: true, skippedByLabel: false, mappedLabel: '' };
+
+  const mapped = rawText
+    ? mapTextToLabel(rawText, cfg.mappingRules, cfg.defaultLabel)
+    : { label: cfg.defaultLabel, matched: false };
+
+  const label = String(mapped.label || cfg.defaultLabel).trim() || cfg.defaultLabel;
+
+  const skippedByLabel = cfg.excludeIfMappedLabelIn.some((l) => l && l === label.toLowerCase());
+  if (skippedByLabel) return { reason: '', skippedByText: false, skippedByLabel: true, mappedLabel: label };
+
+  return { reason: label, skippedByText: false, skippedByLabel: false, mappedLabel: label };
 }
 
-function buildMarkdown(sub: string, title: string, rows: Array<{ name: string; note: string }>, maxRows: number): string {
+async function iterateListingFirstString(listing: any, extractor: (x: any) => string): Promise<string> {
+  if (!listing) return '';
+  try {
+    if (typeof listing?.all === 'function') {
+      const items = await listing.all();
+      for (const item of items ?? []) {
+        const v = extractor(item);
+        if (v) return v;
+      }
+      return '';
+    }
+    if (typeof listing?.[Symbol.asyncIterator] === 'function') {
+      for await (const item of listing) {
+        const v = extractor(item);
+        if (v) return v;
+      }
+      return '';
+    }
+    const children = listing?.data?.children ?? listing?.children;
+    if (Array.isArray(children)) {
+      for (const item of children) {
+        const v = extractor(item);
+        if (v) return v;
+      }
+    }
+  } catch {}
+  return '';
+}
+
+// ---------------- KV DB ----------------
+async function dbReadIndex(ctx: Context): Promise<string[]> {
+  const sub = ctx.subredditName!;
+  const raw = await ctx.kvStore.get(kvDbIndexKey(sub));
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.map((x: any) => String(x ?? '')).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function dbWriteIndex(ctx: Context, users: string[]): Promise<void> {
+  const sub = ctx.subredditName!;
+  const uniq = Array.from(new Set(users.map((u) => String(u).trim()).filter(Boolean)));
+  uniq.sort((a, b) => a.localeCompare(b));
+  await ctx.kvStore.put(kvDbIndexKey(sub), JSON.stringify(uniq));
+}
+
+async function dbUpsert(ctx: Context, username: string, reason: string, raw?: string): Promise<void> {
+  const sub = ctx.subredditName!;
+  const u = String(username ?? '').trim().replace(/^u\//i, '');
+  if (!u) return;
+  const uLower = u.toLowerCase();
+
+  const finalReason = String(reason ?? '').trim() || 'Banned';
+
+  const rec: BanRecord = {
+    u,
+    reason: finalReason,
+    raw: raw ? String(raw).trim() : undefined,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await ctx.kvStore.put(kvDbUserKey(sub, uLower), JSON.stringify(rec));
+
+  const idx = await dbReadIndex(ctx);
+  if (!idx.some((x) => x.toLowerCase() === uLower)) {
+    idx.push(u);
+    await dbWriteIndex(ctx, idx);
+  }
+}
+
+async function dbDelete(ctx: Context, username: string): Promise<void> {
+  const sub = ctx.subredditName!;
+  const u = String(username ?? '').trim().replace(/^u\//i, '');
+  if (!u) return;
+  const uLower = u.toLowerCase();
+
+  try {
+    await ctx.kvStore.delete(kvDbUserKey(sub, uLower));
+  } catch {}
+
+  const idx = await dbReadIndex(ctx);
+  const next = idx.filter((x) => x.toLowerCase() !== uLower);
+  if (next.length !== idx.length) await dbWriteIndex(ctx, next);
+}
+
+async function dbReadAll(ctx: Context): Promise<BanRecord[]> {
+  const sub = ctx.subredditName!;
+  const idx = await dbReadIndex(ctx);
+  const out: BanRecord[] = [];
+  for (const u of idx) {
+    const raw = await ctx.kvStore.get(kvDbUserKey(sub, u.toLowerCase()));
+    if (!raw) continue;
+    try {
+      const rec = JSON.parse(raw) as BanRecord;
+      if (rec?.u) out.push(rec);
+    } catch {}
+  }
+  return out;
+}
+
+async function dbClearAll(ctx: Context): Promise<{ deletedUsers: number }> {
+  const sub = ctx.subredditName!;
+  const idx = await dbReadIndex(ctx);
+
+  let deletedUsers = 0;
+  for (const u of idx) {
+    const uLower = String(u ?? '').toLowerCase();
+    if (!uLower) continue;
+    try {
+      await ctx.kvStore.delete(kvDbUserKey(sub, uLower));
+      deletedUsers++;
+    } catch {}
+  }
+
+  try {
+    await ctx.kvStore.delete(kvDbIndexKey(sub));
+  } catch {}
+
+  return { deletedUsers };
+}
+
+// ---------------- Import status ----------------
+async function readImportStatus(ctx: Context): Promise<ImportStatus> {
+  const sub = ctx.subredditName!;
+  const raw = await ctx.kvStore.get(kvImportStatusKey(sub));
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as ImportStatus;
+  } catch {
+    return {};
+  }
+}
+
+async function writeImportStatus(ctx: Context, patch: ImportStatus): Promise<void> {
+  const sub = ctx.subredditName!;
+  const prev = await readImportStatus(ctx);
+  const next: ImportStatus = {
+    ...prev,
+    ...patch,
+    totalImported: (prev.totalImported ?? 0) + (patch.lastChunkImported ?? 0),
+    totalSkipped: (prev.totalSkipped ?? 0) + (patch.lastChunkSkipped ?? 0),
+  };
+  await ctx.kvStore.put(kvImportStatusKey(sub), JSON.stringify(next));
+}
+
+// ---------------- Markdown ----------------
+function buildMarkdownFromDb(sub: string, title: string, rows: Array<{ u: string; reason: string }>, maxRows: number): string {
   const updated = new Date().toISOString();
   const header =
     `# ${escapeMd(title)}\n\n` +
     `**Subreddit:** r/${escapeMd(sub)}\n` +
     `**Last updated:** ${escapeMd(updated)}\n\n`;
 
-  if (!rows.length) return `${header}_No banned users found (or missing permissions)._`;
+  if (!rows.length) return `${header}_No entries in DB yet._`;
 
   const MAX_BODY_CHARS = 39000;
-  let out = header + `| Name | Note |\n|------|------|\n`;
+  let out = header + `| Name | Reason |\n|------|--------|\n`;
 
   let added = 0;
   let truncated = false;
 
   for (const r of rows.slice(0, maxRows)) {
-    const line = `| u/${escapeMd(r.name)} | ${escapeMd(r.note)} |\n`;
+    const line = `| u/${escapeMd(r.u)} | ${escapeMd(r.reason)} |\n`;
     if (out.length + line.length + 200 > MAX_BODY_CHARS) {
       truncated = true;
       break;
@@ -330,154 +521,11 @@ function buildMarkdown(sub: string, title: string, rows: Array<{ name: string; n
     added++;
   }
 
-  if (truncated) out += `\n_⚠️ Truncated to ${added} rows due to Reddit post size limits._\n`;
+  if (truncated) out += `\n_Truncated to ${added} rows due to Reddit post size limits._\n`;
   return out;
 }
 
-
-function logBanUserDebug(u: any, idx: number, extracted: { name: string; note: string; reason: string; raw: string }, mapping: { label: string; matched: boolean }, excluded: { byText: boolean; byLabel: boolean }, cfg: { maskUsernamesInNote: boolean }): void {
-  const topKeys = Object.keys(u ?? {});
-  const dataKeys = Object.keys((u?.data ?? {}) ?? {});
-  console.log('[banlist] banned_user_debug', {
-    idx,
-    topKeys,
-    dataKeys,
-    extracted,
-    mapping,
-    excluded,
-    cfg,
-    raw: userToPlain(u),
-  });
-}
-
-// -------------------- Ban listing extraction (defensive) --------------------
-function pickBanName(u: any): string {
-  return String(u?.name ?? u?.username ?? u?.data?.name ?? u?.data?.username ?? '').trim();
-}
-
-function pickBanNote(u: any): string {
-  const src = u?.data ?? u;
-  const noteRaw =
-    src?.note ??
-    src?.ban_note ??
-    src?.banNote ??
-    src?.mod_note ??
-    src?.modNote ??
-    src?.user_note ??
-    src?.userNote ??
-    src?.note_text ??
-    src?.noteText ??
-    src?.note_markdown ??
-    src?.noteMarkdown ??
-    src?.ban_note_markdown ??
-    src?.banNoteMarkdown;
-  return String(noteRaw ?? '').trim();
-}
-
-function pickBanReason(u: any): string {
-  const src = u?.data ?? u;
-  const reasonRaw =
-    src?.reason ??
-    src?.ban_reason ??
-    src?.banReason ??
-    src?.rule_reason ??
-    src?.reason_text ??
-    src?.reasonText ??
-    src?.rule ??
-    src?.ban_rule ??
-    src?.banRule;
-  return String(reasonRaw ?? '').trim();
-}
-
-async function fetchBannedUsers(ctx: Context, subredditName: string, limit: number, verbose: boolean): Promise<{ rows: BannedListingRow[]; sampleObj: any; sampleKeys: string[]; sampleDataKeys: string[] }> {
-  const pageSize = 100;
-  const out: BannedListingRow[] = [];
-  const seen = new Set<string>();
-
-  // @ts-ignore
-  const listing: any = await ctx.reddit.getBannedUsers({ subredditName, limit: Math.min(pageSize, limit), pageSize });
-  const hasPrivateFetch = typeof listing?._fetch === 'function';
-
-  const extractChildren = (pageObj: any): any[] =>
-    (pageObj?.children as any[]) ?? (pageObj?.data?.children as any[]) ?? [];
-
-  let sampleObj: any = null;
-  let sampleKeys: string[] = [];
-  let sampleDataKeys: string[] = [];
-
-  const addUsers = (users: any[]) => {
-    for (const u of users ?? []) {
-      if (!sampleObj) {
-        sampleObj = u;
-        sampleKeys = Object.keys(u ?? {});
-        sampleDataKeys = Object.keys((u?.data ?? {}) ?? {});
-      }
-
-      const name = pickBanName(u);
-      if (!name) continue;
-      const key = name.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      const note = pickBanNote(u);
-      const reason = pickBanReason(u);
-      const raw = (note || reason || '').trim();
-
-      out.push({ name, note, reason, raw });
-      if (out.length >= limit) break;
-    }
-  };
-
-  if (verbose) console.log('[banlist] fetchBannedUsers start', { hasPrivateFetch, limit });
-
-  if (hasPrivateFetch) {
-    let after: string | null = null;
-    let loops = 0;
-
-    while (out.length < limit && loops < 300) {
-      loops++;
-
-      // @ts-ignore
-      const pageObj = await listing._fetch({
-        subredditName,
-        limit: Math.min(pageSize, Math.max(0, limit - out.length)),
-        pageSize,
-        after: after ?? undefined,
-      });
-
-      const users = extractChildren(pageObj);
-      addUsers(users);
-
-      const nextAfter: string | null =
-        (typeof pageObj?.after === 'string' ? pageObj.after : null) ??
-        (typeof pageObj?.data?.after === 'string' ? pageObj.data.after : null);
-
-      if (!users || users.length === 0) break;
-      if (nextAfter && nextAfter !== after) {
-        after = nextAfter;
-        continue;
-      }
-      if (users.length < pageSize) break;
-      break;
-    }
-
-    if (verbose) console.log('[banlist] fetchBannedUsers done', { total: out.length, loops });
-    return { rows: out, sampleObj, sampleKeys, sampleDataKeys };
-  }
-
-  // fallback: try listing children or .all()
-  let users: any[] = extractChildren(listing);
-  if ((!users || users.length === 0) && typeof listing?.all === 'function') {
-    // @ts-ignore
-    users = (await listing.all()) ?? [];
-  }
-  addUsers(users);
-
-  if (verbose) console.log('[banlist] fetchBannedUsers done (fallback)', { total: out.length });
-  return { rows: out, sampleObj, sampleKeys, sampleDataKeys };
-}
-
-// -------------------- Post editability helpers --------------------
+// ---------------- Post editability ----------------
 function toBoolStrict(v: any): boolean {
   if (v === true) return true;
   if (v === false) return false;
@@ -508,8 +556,8 @@ async function canEditPost(reddit: RedditAPIClient, postId: string): Promise<{ o
   }
 }
 
-// -------------------- Scheduler control (avoid cron limit) --------------------
-async function ensureSingleCronScheduled(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<void> {
+// ---------------- Scheduler control ----------------
+async function ensureSinglePostCronScheduled(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<void> {
   const sub = ctx.subredditName!;
   const cronKey = kvCronKey(sub, cfg.postIdKey);
   const jobKey = kvJobIdKey(sub, cfg.postIdKey);
@@ -520,41 +568,38 @@ async function ensureSingleCronScheduled(ctx: Context, cfg: Config, snap: DebugS
   snap.scheduler.prevCron = prevCron;
   snap.scheduler.prevJobId = prevJobId;
 
-  if (!cfg.scheduleEnabled) {
-    snap.scheduler.note.push('scheduleEnabled=false -> not scheduling');
+  if (!cfg.postScheduleEnabled) {
+    snap.scheduler.note.push('postScheduleEnabled=false');
     return;
   }
 
-  // If unchanged and we have a jobId, do nothing.
-  if (prevCron === cfg.scheduleCron && prevJobId) {
-    snap.scheduler.note.push('cron unchanged + jobId exists -> not rescheduling');
+  if (prevCron === cfg.postScheduleCron && prevJobId) {
+    snap.scheduler.note.push('post cron unchanged');
     return;
   }
 
-  // Cancel previous job if possible
   if (prevJobId && typeof (ctx.scheduler as any)?.cancelJob === 'function') {
     try {
       await (ctx.scheduler as any).cancelJob(prevJobId);
-      snap.scheduler.note.push(`canceled previous jobId=${prevJobId}`);
+      snap.scheduler.note.push(`canceled post jobId=${prevJobId}`);
     } catch (e: any) {
-      snap.scheduler.note.push(`cancelJob failed (continuing): ${e?.message ?? String(e)}`);
+      snap.scheduler.note.push(`cancelJob failed: ${e?.message ?? String(e)}`);
     }
   }
 
-  // Schedule new
   try {
     const newJobId = await ctx.scheduler.runJob({
-      name: JOB_NAME_NEW,
-      cron: cfg.scheduleCron,
+      name: JOB_POST,
+      cron: cfg.postScheduleCron,
       data: { idKey: cfg.postIdKey },
     } as any);
 
     const newJobIdStr = String(newJobId);
     await ctx.kvStore.put(jobKey, newJobIdStr);
-    await ctx.kvStore.put(cronKey, cfg.scheduleCron);
+    await ctx.kvStore.put(cronKey, cfg.postScheduleCron);
 
     snap.scheduler.newJobId = newJobIdStr;
-    snap.scheduler.note.push(`scheduled jobId=${newJobIdStr} cron=${cfg.scheduleCron}`);
+    snap.scheduler.note.push(`scheduled post jobId=${newJobIdStr} cron=${cfg.postScheduleCron}`);
   } catch (e: any) {
     const msg = e?.cause?.details ?? e?.message ?? String(e);
     snap.scheduler.error = msg;
@@ -562,122 +607,244 @@ async function ensureSingleCronScheduled(ctx: Context, cfg: Config, snap: DebugS
   }
 }
 
-async function purgeOldCronsAndReschedule(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<string[]> {
-  const sub = ctx.subredditName!;
-  const jobKey = kvJobIdKey(sub, cfg.postIdKey);
-  const cronKey = kvCronKey(sub, cfg.postIdKey);
+// ---------------- Modlog + Modnotes ----------------
+function extractTargetUserFromEvent(ev: any): string {
+  return String(ev?.targetUser?.name ?? '').trim();
+}
 
-  const canceled: string[] = [];
-  const canList = typeof (ctx.scheduler as any)?.listJobs === 'function';
-  const canCancel = typeof (ctx.scheduler as any)?.cancelJob === 'function';
+function actionedAtMs(ev: any): number {
+  const s = String(ev?.actionedAt ?? '').trim();
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : Date.now();
+}
 
-  const storedJobId = (await ctx.kvStore.get(jobKey)) ?? null;
-  if (canCancel && storedJobId) {
-    try {
-      await (ctx.scheduler as any).cancelJob(storedJobId);
-      canceled.push(storedJobId);
-      snap.scheduler.note.push(`purge canceled stored jobId=${storedJobId}`);
-    } catch (e: any) {
-      snap.scheduler.note.push(`purge cancel stored jobId failed: ${e?.message ?? String(e)}`);
-    }
+function modlogTargetUsername(item: any): string {
+  return String(
+    item?.targetUser?.name ??
+      item?.targetAuthor?.name ??
+      item?.target?.author ??
+      item?.target?.name ??
+      item?.target ??
+      ''
+  ).trim();
+}
+
+function extractReasonFromModlog(item: any): string {
+  return String(item?.description ?? '').trim();
+}
+
+function extractDetailsFromModlog(item: any): string {
+  return String(item?.details ?? '').trim();
+}
+
+function looksTemporaryFromText(text: string): boolean {
+  const t = String(text ?? '').toLowerCase();
+  if (!t) return false;
+  if (/\btemporary\b/.test(t)) return true;
+  if (/\b\d+\s*(day|days|week|weeks|month|months)\b/.test(t)) return true;
+  if (/\bfor\s+\d+\b/.test(t) && /\b(day|days|week|weeks|month|months)\b/.test(t)) return true;
+  return false;
+}
+
+function looksPermanentFromText(text: string): boolean {
+  const t = String(text ?? '').toLowerCase();
+  if (!t) return false;
+  if (/\bpermanent\b/.test(t)) return true;
+  if (/\bperm\b/.test(t)) return true;
+  return false;
+}
+
+function isPermanentFromModlog(item: any): boolean {
+  const details = extractDetailsFromModlog(item);
+  const t = String(details ?? '').toLowerCase().trim();
+
+  if (!t) return true; // default to permanent
+
+  if (looksTemporaryFromText(t)) return false;
+
+  if (looksPermanentFromText(t)) return true;
+
+  return true; // unknown wording → assume permanent
+}
+
+async function fetchLatestBanModlogEntry(
+  ctx: Context,
+  subredditName: string,
+  userName: string,
+  actedAt: number,
+  cfg: Config
+): Promise<any | null> {
+  const targetLower = userName.toLowerCase();
+  const windowMs = cfg.modLogMatchWindowSeconds * 1000;
+
+  let listing: any;
+  try {
+    listing = await (ctx.reddit as any).getModerationLog({
+      subredditName,
+      type: 'banuser',
+      limit: cfg.modLogLookupLimit,
+    });
+  } catch {
+    return null;
   }
+  console.log('[banlist] getModLogs Listing:', JSON.stringify(listing));
+  const score = (item: any) => {
+    const ts =
+      Date.parse(String(item?.actionedAt ?? '')) ||
+      Date.parse(String(item?.createdAt ?? '')) ||
+      Date.parse(String(item?.created ?? '')) ||
+      actedAt;
+    const delta = Math.abs(ts - actedAt);
+    return delta <= windowMs ? delta : Number.POSITIVE_INFINITY;
+  };
 
-  if (canList && canCancel) {
-    try {
-      const jobs = await (ctx.scheduler as any).listJobs();
-      for (const j of jobs ?? []) {
-        const isCron = typeof j?.cron === 'string' && j.cron.length > 0;
-        const isOurName = j?.name === JOB_NAME_NEW || j?.name === JOB_NAME_LEGACY;
-        if (!isCron || !isOurName) continue;
+  let best: any | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
 
-        // If data.idKey exists, match it; otherwise cancel anyway (best effort cleanup)
-        const dataIdKey = j?.data?.idKey ? String(j.data.idKey) : null;
-        if (dataIdKey && dataIdKey !== cfg.postIdKey) continue;
-
-        try {
-          const jid = String(j.id);
-          await (ctx.scheduler as any).cancelJob(jid);
-          canceled.push(jid);
-        } catch {
-          // ignore
+  try {
+    if (typeof listing?.all === 'function') {
+      const items = await listing.all();
+      for (const item of items ?? []) {
+        const t = modlogTargetUsername(item);
+        if (!t || t.toLowerCase() !== targetLower) continue;
+        const s = score(item);
+        if (s < bestScore) {
+          bestScore = s;
+          best = item;
         }
       }
-      snap.scheduler.note.push(`purge listJobs canceled=${canceled.length}`);
-    } catch (e: any) {
-      snap.scheduler.note.push(`purge listJobs failed: ${e?.message ?? String(e)}`);
+    } else if (typeof listing?.[Symbol.asyncIterator] === 'function') {
+      for await (const item of listing) {
+        const t = modlogTargetUsername(item);
+        if (!t || t.toLowerCase() !== targetLower) continue;
+        const s = score(item);
+        if (s < bestScore) {
+          bestScore = s;
+          best = item;
+        }
+      }
     }
+  } catch {}
+
+  if (!best || !Number.isFinite(bestScore)) return null;
+  return best;
+}
+
+function extractNoteFromModNoteEntry(n: any): string {
+  const candidates = [
+    n?.note,
+    n?.text,
+    n?.body,
+    n?.description,
+    n?.userNote?.note,
+    n?.userNote?.text,
+    n?.userNote?.body,
+    n?.userNote?.description,
+    n?.label,
+    n?.userNote?.label,
+  ];
+  for (const c of candidates) {
+    const s = String(c ?? '').trim();
+    if (s) return s;
+  }
+  return '';
+}
+
+async function fetchLatestModNoteText(
+  reddit: RedditAPIClient,
+  subredditName: string,
+  username: string,
+  limit: number,
+  verbose: boolean,
+  filter: ModNoteType = 'BAN'
+): Promise<{ note: string; filterUsed: ModNoteType | null; error?: string }> {
+  const sub = String(subredditName ?? '').trim().replace(/^r\//i, '');
+  const user = String(username ?? '').trim().replace(/^u\//i, '');
+
+  if (!sub || !user) return { note: '', filterUsed: null };
+
+  const read = async (f: ModNoteType) => {
+    const opts: any = {
+      subreddit: sub,
+      user,
+      filter: f,
+      limit: Math.max(1, limit),
+    };
+
+    if (verbose) console.log('[banlist] getModNotes req:', JSON.stringify(opts));
+
+    // @ts-ignore
+    const listing = await (reddit as any).getModNotes(opts);
+    return await iterateListingFirstString(listing, (x) => extractNoteFromModNoteEntry(x));
+  };
+
+  try {
+    const primary = String(await read(filter)).trim();
+    if (primary) return { note: primary, filterUsed: filter };
+
+    if (filter !== 'ALL') {
+      const fallback = String(await read('ALL')).trim();
+      if (fallback) return { note: fallback, filterUsed: 'ALL' };
+    }
+
+    return { note: '', filterUsed: null };
+  } catch (e: any) {
+    const msg = e?.cause?.details ?? e?.message ?? String(e);
+    if (msg.includes('USER_DOESNT_EXIST')) {
+      if (verbose) console.log('[banlist] getModNotes: USER_DOESNT_EXIST');
+      return { note: '', filterUsed: null };
+    }
+    return { note: '', filterUsed: null, error: msg };
+  }
+}
+
+async function fetchBanReason(
+  ctx: Context,
+  subredditName: string,
+  username: string,
+  actedMs: number,
+  cfg: Config,
+  snap?: DebugSnapshot
+): Promise<{ rawReason: string; isPermanent: boolean | null; source: 'modlog' | 'modnotes' | 'none'; modlog?: any | null }> {
+  const user = String(username ?? '').trim().replace(/^u\//i, '');
+  if (!user) return { rawReason: '', isPermanent: null, source: 'none', modlog: null };
+
+  const modlog = await fetchLatestBanModlogEntry(ctx, subredditName, user, actedMs, cfg);
+
+  if (modlog) {
+    const isPermanent = isPermanentFromModlog(modlog);
+    if (isPermanent === false) {
+      snap?.modAction.note.push('temp_ban_ignored');
+      return { rawReason: '', isPermanent: false, source: 'none', modlog };
+    }
+
+    const reason = extractReasonFromModlog(modlog); // uses description
+    if (reason) {
+      snap?.modAction.note.push('modlog_reason_used');
+      return { rawReason: reason, isPermanent: true, source: 'modlog', modlog };
+    }
+
+    snap?.modAction.note.push('modlog_reason_empty');
+    // fall through to modnotes fallback
   } else {
-    snap.scheduler.note.push('purge: listJobs/cancelJob not available; only stored jobId attempted');
+    snap?.modAction.note.push('modlog_no_match');
   }
 
-  // Clear KV schedule tracking
-  try { await ctx.kvStore.delete(jobKey); } catch {}
-  try { await ctx.kvStore.delete(cronKey); } catch {}
-
-  // Reschedule
-  await ensureSingleCronScheduled(ctx, cfg, snap);
-
-  return canceled;
-}
-
-// -------------------- Build rows --------------------
-async function buildRows(ctx: Context, cfg: Config, snap: DebugSnapshot): Promise<Array<{ name: string; note: string; raw: string; label: string }>> {
-  const sub = ctx.subredditName!;
-  const verbose = cfg.debugVerbose;
-
-  const fetched = await fetchBannedUsers(ctx, sub, cfg.banListLimit, verbose);
-  const banned = fetched.rows;
-
-  snap.bans.total = banned.length;
-  snap.bans.sample = fetched.sampleObj ? [fetched.sampleObj] : [];
-  snap.bans.sampleKeys = fetched.sampleKeys;
-  snap.bans.sampleDataKeys = fetched.sampleDataKeys;
-
-  let excludedByText = 0;
-  let excludedByLabel = 0;
-
-  const out: Array<{ name: string; note: string; raw: string; label: string }> = [];
-
-  for (const u of banned) {
-    const combinedText = `${u.note} ${u.reason}`.toLowerCase();
-    const excludedText = cfg.excludeIfTextContains.some((needle) => needle && combinedText.includes(needle));
-    if (excludedText) {
-      excludedByText += 1;
-      continue;
-    }
-
-    // bookmarklet-style: use NOTE; fallback to REASON
-    const baseRaw = (u.note || u.reason || '').trim();
-    const maybeMasked = cfg.maskUsernamesInNote ? maskUsernamesInsideNote(baseRaw) : baseRaw;
-
-    const mapped = maybeMasked
-      ? mapTextToLabel(maybeMasked, cfg.mappingRules, cfg.defaultLabel)
-      : { label: cfg.defaultLabel, matched: false };
-
-    const label = (mapped.label || cfg.defaultLabel).trim() || cfg.defaultLabel;
-    const labelLower = label.toLowerCase();
-
-    const excludedLabel = cfg.excludeIfMappedLabelIn.some((l) => l && l === labelLower);
-    if (excludedLabel) {
-      excludedByLabel += 1;
-      continue;
-    }
-
-    out.push({ name: u.name, note: label, raw: baseRaw, label });
+  const mn = await fetchLatestModNoteText(ctx.reddit, subredditName, user, cfg.modNotesLookupLimit, cfg.debugVerbose, 'BAN');
+  if (mn.note) {
+    snap?.modAction.note.push(`modnotes_used:${mn.filterUsed}`);
+    return { rawReason: mn.note, isPermanent: modlog ? isPermanentFromModlog(modlog) : null, source: 'modnotes', modlog };
   }
 
-  if (cfg.sortBy === 'note_asc') out.sort((a, b) => a.note.localeCompare(b.note));
-  else out.sort((a, b) => a.name.localeCompare(b.name));
+  if (mn.error) snap?.modAction.note.push(`modnotes_error:${mn.error}`);
+  else snap?.modAction.note.push('modnotes_empty');
 
-  snap.rows.excludedByText = excludedByText;
-  snap.rows.excludedByLabel = excludedByLabel;
-
-  snap.rows.sample = out.slice(0, 10).map((r) => ({ u: `u/${r.name}`, raw: r.raw, label: r.label }));
-
-  return out;
+  return { rawReason: '', isPermanent: modlog ? isPermanentFromModlog(modlog) : null, source: 'none', modlog };
 }
 
-// -------------------- Core run --------------------
+// ---------------- Publishing ----------------
+type RunMode = 'update_existing_only' | 'create_new_and_set_active' | 'create_new_no_change_active';
+
 async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: RunMode): Promise<{ rows: number; postId: string | null; action: string }> {
   const sub = ctx.subredditName;
   if (!sub) return { rows: 0, postId: null, action: 'no_subreddit' };
@@ -690,53 +857,59 @@ async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: Run
     idKey: cfg.postIdKey,
     actor,
     cfg: {
-      scheduleEnabled: cfg.scheduleEnabled,
-      scheduleCron: cfg.scheduleCron,
-      banListLimit: cfg.banListLimit,
+      postScheduleEnabled: cfg.postScheduleEnabled,
+      postScheduleCron: cfg.postScheduleCron,
       maxRowsInPost: cfg.maxRowsInPost,
       excludeIfTextContains: cfg.excludeIfTextContains,
       excludeIfMappedLabelIn: cfg.excludeIfMappedLabelIn,
       mappingRulesCount: cfg.mappingRules.length,
       defaultLabel: cfg.defaultLabel,
-      maskUsernamesInNote: cfg.maskUsernamesInNote,
       sortBy: cfg.sortBy,
       createNewOnEditFail: cfg.createNewOnEditFail,
       setNewPostAsActive: cfg.setNewPostAsActive,
+      modLogLookupLimit: cfg.modLogLookupLimit,
+      modLogMatchWindowSeconds: cfg.modLogMatchWindowSeconds,
+      modNotesLookupLimit: cfg.modNotesLookupLimit,
     },
-    bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
-    rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+    db: { total: 0, sample: [] },
+    import: await readImportStatus(ctx),
+    modAction: { note: [] },
     post: { storedPostId: null, action: 'none', finalPostId: null },
     scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
   };
 
-  if (cfg.debugVerbose) console.log('[banlist] runPublish', { actor, mode, sub, idKey: cfg.postIdKey });
+  const all = await dbReadAll(ctx);
 
-  const built = await buildRows(ctx, cfg, snap);
-  const rows = built.map((r) => ({ name: r.name, note: r.note }));
-  snap.rows.out = rows.length;
+  const rows = all
+    .map((r) => ({
+      u: r.u,
+      reason: String(r.reason ?? '').trim() || cfg.defaultLabel || 'Banned',
+    }))
+    .filter((r) => r.u);
 
-  const body = buildMarkdown(sub, cfg.postTitle, rows, cfg.maxRowsInPost);
+  if (cfg.sortBy === 'reason_asc') rows.sort((a, b) => a.reason.localeCompare(b.reason) || a.u.localeCompare(b.u));
+  else rows.sort((a, b) => a.u.localeCompare(b.u));
+
+  snap.db.total = rows.length;
+  snap.db.sample = rows.slice(0, 10);
+
+  const body = buildMarkdownFromDb(sub, cfg.postTitle, rows, cfg.maxRowsInPost);
 
   const stored = await readStoredPostRef(ctx, cfg.postIdKey);
   snap.post.storedPostId = stored?.postId ?? null;
 
-  // Create modes
   if (mode === 'create_new_and_set_active' || mode === 'create_new_no_change_active') {
     const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
     snap.post.action = mode === 'create_new_and_set_active' ? 'created_set_active' : 'created_not_active';
     snap.post.finalPostId = created.id;
 
-    if (mode === 'create_new_and_set_active') {
-      await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
-    }
+    if (mode === 'create_new_and_set_active') await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
 
     await writeDebug(ctx, cfg.postIdKey, snap);
     return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 
-  // Update existing only
   if (!stored?.postId) {
-    // No stored post -> create and set active (always)
     const created = await ctx.reddit.submitPost({ subredditName: sub, title: cfg.postTitle, text: body });
     await writeStoredPostRef(ctx, cfg.postIdKey, created.id);
     snap.post.action = 'created_no_stored_active_set';
@@ -746,7 +919,6 @@ async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: Run
     return { rows: rows.length, postId: created.id, action: snap.post.action };
   }
 
-  // Try edit active post
   const editable = await canEditPost(ctx.reddit, stored.postId);
   if (!editable.canEdit) {
     if (!cfg.createNewOnEditFail) {
@@ -797,31 +969,212 @@ async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: Run
   }
 }
 
-// -------------------- Scheduler jobs --------------------
-Devvit.addSchedulerJob({
-  name: JOB_NAME_NEW,
-  onRun: async (_event, ctx) => {
+// ---------------- Manual import ----------------
+function parseBackfillJsonToEntries(input: string): Array<{ u: string; raw: string }> {
+  const txt = String(input ?? '').trim();
+  if (!txt) return [];
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(txt);
+  } catch {
+    return [];
+  }
+
+  const out: Array<{ u: string; raw: string }> = [];
+
+  const pushOne = (u: any, raw: any) => {
+    const name = String(u ?? '').trim().replace(/^u\//i, '');
+    if (!name) return;
+    out.push({ u: name, raw: String(raw ?? '').trim() });
+  };
+
+  const walk = (node: any) => {
+    if (!node) return;
+
+    if (Array.isArray(node)) {
+      for (const x of node) walk(x);
+      return;
+    }
+
+    if (typeof node === 'string') {
+      pushOne(node, '');
+      return;
+    }
+
+    if (typeof node === 'object') {
+      const maybeChildren = node?.data?.children ?? node?.children;
+      if (Array.isArray(maybeChildren)) {
+        walk(maybeChildren);
+        return;
+      }
+
+      const u = node?.u ?? node?.user ?? node?.username ?? node?.name ?? node?.data?.name ?? node?.data?.username ?? node?.data?.user;
+      const raw = node?.raw ?? node?.reason ?? node?.note ?? node?.ban_note ?? node?.banNote ?? node?.data?.note ?? node?.data?.reason;
+
+      if (u) pushOne(u, raw);
+      return;
+    }
+  };
+
+  walk(parsed);
+  return out;
+}
+
+async function runImport(ctx: Context, jsonText: string): Promise<{ imported: number; skipped: number; total: number; lastUser?: string }> {
+  const cfg = await getCfg(ctx);
+  const entries = parseBackfillJsonToEntries(jsonText);
+
+  let imported = 0;
+  let skipped = 0;
+  let lastUser: string | undefined;
+
+  for (const e of entries) {
+    lastUser = e.u;
+
+    const raw = String(e.raw ?? '').trim();
+    const normalized = normalizeReason(raw, cfg);
+
+    if (normalized.skippedByText || normalized.skippedByLabel) {
+      skipped++;
+      continue;
+    }
+
+    const reason = (normalized.reason || cfg.defaultLabel || 'Banned').trim() || 'Banned';
+    await dbUpsert(ctx, e.u, reason, raw);
+    imported++;
+  }
+
+  await writeImportStatus(ctx, {
+    lastImportedAt: new Date().toISOString(),
+    lastImportedUser: lastUser,
+    lastChunkTotal: entries.length,
+    lastChunkImported: imported,
+    lastChunkSkipped: skipped,
+  });
+
+  return { imported, skipped, total: entries.length, lastUser };
+}
+
+// ---------------- ModAction trigger ----------------
+Devvit.addTrigger({
+  event: 'ModAction',
+  onEvent: async (event: any, ctx: Context) => {
+    const sub = ctx.subredditName;
+    if (!sub) return;
+
+    let cfg: Config;
     try {
-      await runPublish(ctx, 'cron', 'update_existing_only');
+      cfg = await getCfg(ctx);
+    } catch {
+      return;
+    }
+
+    const snap: DebugSnapshot = {
+      ts: new Date().toISOString(),
+      subreddit: sub,
+      idKey: cfg.postIdKey,
+      actor: 'mod_action',
+      cfg: {
+        excludeIfTextContains: cfg.excludeIfTextContains,
+        excludeIfMappedLabelIn: cfg.excludeIfMappedLabelIn,
+        mappingRulesCount: cfg.mappingRules.length,
+        defaultLabel: cfg.defaultLabel,
+        modLogLookupLimit: cfg.modLogLookupLimit,
+        modLogMatchWindowSeconds: cfg.modLogMatchWindowSeconds,
+        modNotesLookupLimit: cfg.modNotesLookupLimit,
+      },
+      db: { total: 0, sample: [] },
+      import: await readImportStatus(ctx),
+      modAction: { action: null, targetUser: null, isPermanent: null, raw: null, mapped: null, note: [] },
+      post: { storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null, action: 'none', finalPostId: null },
+      scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
+    };
+
+    try {
+      const action = String(event?.action ?? '').toLowerCase();
+      snap.modAction.action = action;
+
+      if (action !== 'banuser' && action !== 'unbanuser') return;
+
+      const targetUser = extractTargetUserFromEvent(event);
+      snap.modAction.targetUser = targetUser || null;
+      if (!targetUser) return;
+
+      if (action === 'unbanuser') {
+        await dbDelete(ctx, targetUser);
+        snap.modAction.note.push('deleted_from_db');
+        await writeDebug(ctx, cfg.postIdKey, snap);
+        return;
+      }
+
+      const actedMs = actionedAtMs(event);
+
+      const res = await fetchBanReason(ctx, sub, targetUser, actedMs, cfg, snap);
+
+      snap.modAction.isPermanent = res.isPermanent;
+      if (res.isPermanent === false) {
+        await writeDebug(ctx, cfg.postIdKey, snap);
+        return;
+      }
+
+      let rawReason = String(res.rawReason ?? '').trim();
+      snap.modAction.raw = rawReason || null;
+
+      const normalized = normalizeReason(rawReason, cfg);
+      snap.modAction.mapped = normalized.mappedLabel || null;
+      snap.modAction.skippedByText = normalized.skippedByText;
+      snap.modAction.skippedByLabel = normalized.skippedByLabel;
+
+      if (normalized.skippedByText) {
+        snap.modAction.note.push('skipped_by_text_contains');
+        await writeDebug(ctx, cfg.postIdKey, snap);
+        return;
+      }
+      if (normalized.skippedByLabel) {
+        snap.modAction.note.push('skipped_by_mapped_label');
+        await writeDebug(ctx, cfg.postIdKey, snap);
+        return;
+      }
+
+      const finalReason = (normalized.reason || cfg.defaultLabel || 'Banned').trim() || 'Banned';
+      await dbUpsert(ctx, targetUser, finalReason, rawReason);
+      snap.modAction.note.push(`upserted_to_db_source=${res.source}`);
+
+      await writeDebug(ctx, cfg.postIdKey, snap);
     } catch (e: any) {
-      console.log('[banlist] cron run failed (swallowed)', e?.message ?? String(e));
+      snap.modAction.error = e?.cause?.details ?? e?.message ?? String(e);
+      try {
+        await writeDebug(ctx, cfg.postIdKey, snap);
+      } catch {}
     }
   },
 });
 
-// Legacy handler to prevent "Job not found" spam from older scheduled jobs
+// ---------------- Scheduler jobs ----------------
 Devvit.addSchedulerJob({
-  name: JOB_NAME_LEGACY,
+  name: JOB_POST,
   onRun: async (_event, ctx) => {
     try {
-      await runPublish(ctx, 'cron', 'update_existing_only');
+      await runPublish(ctx, 'cron_post', 'update_existing_only');
     } catch (e: any) {
-      console.log('[banlist] legacy cron run failed (swallowed)', e?.message ?? String(e));
+      console.log('[banlist] post cron failed', e?.message ?? String(e));
     }
   },
 });
 
-// -------------------- Install/Upgrade trigger (never fail install) --------------------
+Devvit.addSchedulerJob({
+  name: JOB_POST_LEGACY,
+  onRun: async (_event, ctx) => {
+    try {
+      await runPublish(ctx, 'cron_post', 'update_existing_only');
+    } catch (e: any) {
+      console.log('[banlist] legacy post cron failed', e?.message ?? String(e));
+    }
+  },
+});
+
+// ---------------- Install/Upgrade ----------------
 Devvit.addTrigger({
   events: ['AppInstall', 'AppUpgrade'],
   onEvent: async (_event, ctx) => {
@@ -834,8 +1187,9 @@ Devvit.addTrigger({
       idKey: 'unknown',
       actor: 'install_or_upgrade',
       cfg: {},
-      bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
-      rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
+      db: { total: 0, sample: [] },
+      import: await readImportStatus(ctx),
+      modAction: { note: [] },
       post: { storedPostId: null, action: 'install', finalPostId: null },
       scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
     };
@@ -843,64 +1197,94 @@ Devvit.addTrigger({
     try {
       const cfg = await getCfg(ctx);
       snap.idKey = cfg.postIdKey;
-      snap.cfg = { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron };
-
-      // Best-effort schedule only; don't generate posts here.
-      await ensureSingleCronScheduled(ctx, cfg, snap);
-
+      snap.cfg = { postScheduleEnabled: cfg.postScheduleEnabled, postScheduleCron: cfg.postScheduleCron };
+      await ensureSinglePostCronScheduled(ctx, cfg, snap);
       await writeDebug(ctx, cfg.postIdKey, snap);
     } catch (e: any) {
-      // Swallow anything so installation doesn't fail
       snap.scheduler.error = e?.message ?? String(e);
-      snap.scheduler.note.push('install trigger error swallowed');
-      try { await writeDebug(ctx, snap.idKey === 'unknown' ? 'banned-users-list' : snap.idKey, snap); } catch {}
-      console.log('[banlist] install/upgrade failed (swallowed)', e?.message ?? String(e));
+      try {
+        await writeDebug(ctx, snap.idKey === 'unknown' ? 'banned-users-list' : snap.idKey, snap);
+      } catch {}
     }
   },
 });
 
-// -------------------- Menu items --------------------
+// ---------------- Forms + Menu ----------------
+const importForm = Devvit.createForm(
+  () => ({
+    title: 'Import backlog JSON (chunked)',
+    fields: [
+      {
+        name: 'json',
+        label: 'Paste JSON chunk. Run multiple times for large files.',
+        type: 'string',
+        multiline: true,
+        defaultValue: '',
+      },
+    ],
+    acceptLabel: 'Import',
+    cancelLabel: 'Cancel',
+  }),
+  async (event: any, ctx: Context) => {
+    const jsonText = String(event?.values?.json ?? '').trim();
+    if (!jsonText) {
+      ctx.ui.showToast('Nothing pasted.');
+      return;
+    }
+    try {
+      const res = await runImport(ctx, jsonText);
+      ctx.ui.showToast(`Imported ${res.imported}/${res.total}. Skipped ${res.skipped}.`);
+    } catch (e: any) {
+      ctx.ui.showToast(`Import failed: ${e?.message ?? String(e)}`);
+    }
+  }
+);
+
+const clearDbForm = Devvit.createForm(
+  () => ({
+    title: 'Clear banned-user DB',
+    fields: [
+      {
+        name: 'confirm',
+        label: 'Type DELETE to confirm',
+        type: 'string',
+        defaultValue: '',
+      },
+    ],
+    acceptLabel: 'Clear DB',
+    cancelLabel: 'Cancel',
+  }),
+  async (event: any, ctx: Context) => {
+    const confirm = String(event?.values?.confirm ?? '').trim().toUpperCase();
+    if (confirm !== 'DELETE') {
+      ctx.ui.showToast('Canceled.');
+      return;
+    }
+
+    try {
+      const res = await dbClearAll(ctx);
+      ctx.ui.showToast(`DB cleared. Deleted ${res.deletedUsers} users.`);
+    } catch (e: any) {
+      ctx.ui.showToast(`DB clear failed: ${e?.message ?? String(e)}`);
+    }
+  }
+);
 
 Devvit.addMenuItem({
-  label: 'Ban List: Debug dump banned user payloads (first 10)',
+  label: 'Ban List: Import backlog JSON (manual)',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
-    try {
-      const cfg = await getCfg(ctx);
-      const sub = ctx.subredditName!;
-      const fetched = await fetchBannedUsers(ctx, sub, Math.min(1000, cfg.banListLimit), cfg.debugVerbose);
+    ctx.ui.showForm(importForm);
+  },
+});
 
-      const banned = fetched.rows;
-      const limit = Math.min(10, banned.length);
-
-      for (let i = 0; i < limit; i++) {
-        const u = banned[i];
-        const baseRaw = (u.note || u.reason || '').trim();
-        const maybeMasked = cfg.maskUsernamesInNote ? maskUsernamesInsideNote(baseRaw) : baseRaw;
-
-        const mapped = maybeMasked
-          ? mapTextToLabel(maybeMasked, cfg.mappingRules, cfg.defaultLabel)
-          : { label: cfg.defaultLabel, matched: false };
-
-        const combinedText = `${u.note} ${u.reason}`.toLowerCase();
-        const excludedByText = cfg.excludeIfTextContains.some((needle) => needle && combinedText.includes(needle));
-        const excludedByLabel = cfg.excludeIfMappedLabelIn.some((l) => l && l === (mapped.label || cfg.defaultLabel).toLowerCase());
-
-        logBanUserDebug(
-          banned[i],
-          i,
-          { name: u.name, note: u.note, reason: u.reason, raw: baseRaw },
-          mapped,
-          { byText: excludedByText, byLabel: excludedByLabel },
-          { maskUsernamesInNote: cfg.maskUsernamesInNote }
-        );
-      }
-
-      ctx.ui.showToast(`Dumped ${limit} banned user payloads to console.`);
-    } catch (e: any) {
-      ctx.ui.showToast(`Dump failed: ${e?.message ?? String(e)}`);
-    }
+Devvit.addMenuItem({
+  label: 'Ban List: DB Clear ALL (danger)',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, ctx) => {
+    ctx.ui.showForm(clearDbForm);
   },
 });
 
@@ -910,7 +1294,7 @@ Devvit.addMenuItem({
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
     try {
-      const res = await runPublish(ctx, 'manual', 'update_existing_only');
+      const res = await runPublish(ctx, 'manual_post', 'update_existing_only');
       ctx.ui.showToast(`Done: ${res.action}. Rows=${res.rows}`);
     } catch (e: any) {
       ctx.ui.showToast(`Update failed: ${e?.message ?? String(e)}`);
@@ -924,7 +1308,7 @@ Devvit.addMenuItem({
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
     try {
-      const res = await runPublish(ctx, 'manual', 'create_new_and_set_active');
+      const res = await runPublish(ctx, 'manual_post', 'create_new_and_set_active');
       ctx.ui.showToast(`Created new active post. Rows=${res.rows}`);
     } catch (e: any) {
       ctx.ui.showToast(`Create failed: ${e?.message ?? String(e)}`);
@@ -938,7 +1322,7 @@ Devvit.addMenuItem({
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
     try {
-      const res = await runPublish(ctx, 'manual', 'create_new_no_change_active');
+      const res = await runPublish(ctx, 'manual_post', 'create_new_no_change_active');
       ctx.ui.showToast(`Created post (not active). Rows=${res.rows}`);
     } catch (e: any) {
       ctx.ui.showToast(`Create failed: ${e?.message ?? String(e)}`);
@@ -947,7 +1331,7 @@ Devvit.addMenuItem({
 });
 
 Devvit.addMenuItem({
-  label: 'Ban List: Refresh schedule (only if needed)',
+  label: 'Ban List: Refresh post schedule',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
@@ -959,14 +1343,19 @@ Devvit.addMenuItem({
         subreddit: sub,
         idKey: cfg.postIdKey,
         actor: 'schedule_action',
-        cfg: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
-        bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
-        rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
-        post: { storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null, action: 'schedule_refresh', finalPostId: null },
+        cfg: { postScheduleEnabled: cfg.postScheduleEnabled, postScheduleCron: cfg.postScheduleCron },
+        db: { total: 0, sample: [] },
+        import: await readImportStatus(ctx),
+        modAction: { note: [] },
+        post: {
+          storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null,
+          action: 'schedule_refresh',
+          finalPostId: null,
+        },
         scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
       };
 
-      await ensureSingleCronScheduled(ctx, cfg, snap);
+      await ensureSinglePostCronScheduled(ctx, cfg, snap);
       await writeDebug(ctx, cfg.postIdKey, snap);
 
       if (snap.scheduler.error) ctx.ui.showToast(`Schedule error: ${snap.scheduler.error}`);
@@ -978,38 +1367,7 @@ Devvit.addMenuItem({
 });
 
 Devvit.addMenuItem({
-  label: 'Ban List: PURGE old crons + reschedule',
-  location: 'subreddit',
-  forUserType: 'moderator',
-  onPress: async (_event, ctx) => {
-    try {
-      const cfg = await getCfg(ctx);
-      const sub = ctx.subredditName!;
-      const snap: DebugSnapshot = {
-        ts: new Date().toISOString(),
-        subreddit: sub,
-        idKey: cfg.postIdKey,
-        actor: 'schedule_action',
-        cfg: { scheduleEnabled: cfg.scheduleEnabled, scheduleCron: cfg.scheduleCron },
-        bans: { total: 0, sample: [], sampleKeys: [], sampleDataKeys: [] },
-        rows: { out: 0, excludedByText: 0, excludedByLabel: 0, sample: [] },
-        post: { storedPostId: (await readStoredPostRef(ctx, cfg.postIdKey))?.postId ?? null, action: 'schedule_purge', finalPostId: null },
-        scheduler: { note: [], prevCron: null, prevJobId: null, newJobId: null, error: null },
-      };
-
-      const canceled = await purgeOldCronsAndReschedule(ctx, cfg, snap);
-      await writeDebug(ctx, cfg.postIdKey, snap);
-
-      if (snap.scheduler.error) ctx.ui.showToast(`Purge done. Canceled ${canceled.length}. Schedule error: ${snap.scheduler.error}`);
-      else ctx.ui.showToast(`Purge done. Canceled ${canceled.length}. Scheduled OK (or unchanged).`);
-    } catch (e: any) {
-      ctx.ui.showToast(`Purge failed: ${e?.message ?? String(e)}`);
-    }
-  },
-});
-
-Devvit.addMenuItem({
-  label: 'Ban List: Debug (show last snapshot)',
+  label: 'Ban List: Debug snapshot (prints)',
   location: 'subreddit',
   forUserType: 'moderator',
   onPress: async (_event, ctx) => {
@@ -1021,14 +1379,14 @@ Devvit.addMenuItem({
         return;
       }
       console.log('[banlist] DEBUG SNAPSHOT:\n' + JSON.stringify(snap, null, 2));
-      ctx.ui.showToast(`Debug printed. bans=${snap.bans.total} rows=${snap.rows.out}`);
+      ctx.ui.showToast(`Debug printed. db=${snap.db.total}`);
     } catch (e: any) {
       ctx.ui.showToast(`Debug failed: ${e?.message ?? String(e)}`);
     }
   },
 });
 
-// -------------------- Capabilities --------------------
+// ---------------- Capabilities ----------------
 Devvit.configure({
   redditAPI: true,
   kvStore: true,
