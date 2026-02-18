@@ -53,6 +53,13 @@ type Config = {
   modLogMatchWindowSeconds: number;
 
   modNotesLookupLimit: number;
+
+  footerEnabled: boolean;
+  footerText: string;
+  footerLink: string;
+  footerLinkLabel: string;
+
+  postOnlyMappedReasons: boolean;
 };
 
 type StoredPostRef = { postId: string; updatedAt: string; idKey: string };
@@ -176,6 +183,12 @@ Devvit.addSettings([
   { type: 'number', name: 'modLogMatchWindowSeconds', label: 'Modlog match time window (seconds)', defaultValue: 600 },
 
   { type: 'number', name: 'modNotesLookupLimit', label: 'Mod notes lookup limit per ban (1–25)', defaultValue: 5 },
+
+  { type: 'boolean', name: 'footerEnabled', label: 'Enable footer note', defaultValue: true },
+  { type: 'string', name: 'footerText', label: 'Footer text (markdown allowed)', defaultValue: 'If any issues with bot contact u/raypogo. If any issues with ban list, contact the mods.' },
+  { type: 'string', name: 'footerLink', label: 'Footer link (optional)', defaultValue: '' },
+  { type: 'string', name: 'footerLinkLabel', label: 'Footer link label (optional)', defaultValue: 'More info' },
+  { type: 'boolean', name: 'postOnlyMappedReasons', label: 'Posting: only include mapped reasons (exclude default/unmapped)', defaultValue: false },
 ]);
 
 function parseCsvLower(v: string): string[] {
@@ -231,7 +244,15 @@ async function getCfg(ctx: Context): Promise<Config> {
   const modLogMatchWindowSeconds = Math.min(3600, Math.max(30, Number((await ctx.settings.get('modLogMatchWindowSeconds')) ?? 600) || 600));
   const modNotesLookupLimit = Math.min(25, Math.max(1, Number((await ctx.settings.get('modNotesLookupLimit')) ?? 5) || 5));
 
-  return {
+  const footerEnabled = Boolean(await ctx.settings.get('footerEnabled'));
+  
+  const footerText = String((await ctx.settings.get('footerText')) ?? '');
+  const footerLink = String((await ctx.settings.get('footerLink')) ?? '');
+  const footerLinkLabel = String((await ctx.settings.get('footerLinkLabel')) ?? 'More info');
+
+  const postOnlyMappedReasons = Boolean(await ctx.settings.get('postOnlyMappedReasons'));
+
+    return {
     postTitle,
     postIdKey,
     postScheduleEnabled,
@@ -245,6 +266,13 @@ async function getCfg(ctx: Context): Promise<Config> {
     createNewOnEditFail,
     setNewPostAsActive,
     debugVerbose,
+
+    footerEnabled,
+    footerText,
+    footerLink,
+    footerLinkLabel,
+    postOnlyMappedReasons,
+
     modLogLookupLimit,
     modLogMatchWindowSeconds,
     modNotesLookupLimit,
@@ -344,6 +372,24 @@ function normalizeReason(
   if (skippedByLabel) return { reason: '', skippedByText: false, skippedByLabel: true, mappedLabel: label };
 
   return { reason: label, skippedByText: false, skippedByLabel: false, mappedLabel: label };
+}
+
+function formatTorontoTime(iso: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Toronto',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    }).format(new Date(iso));
+  } catch {
+    return iso;
+  }
 }
 
 async function iterateListingFirstString(listing: any, extractor: (x: any) => string): Promise<string> {
@@ -496,14 +542,26 @@ async function writeImportStatus(ctx: Context, patch: ImportStatus): Promise<voi
 }
 
 // ---------------- Markdown ----------------
-function buildMarkdownFromDb(sub: string, title: string, rows: Array<{ u: string; reason: string }>, maxRows: number): string {
-  const updated = new Date().toISOString();
+function buildMarkdownFromDb(
+  sub: string,
+  title: string,
+  rows: Array<{ u: string; reason: string }>,
+  maxRows: number,
+  cfg: Config
+): string {
+  const updatedIso = new Date().toISOString();
+  const updated = formatTorontoTime(updatedIso);
+
   const header =
     `# ${escapeMd(title)}\n\n` +
     `**Subreddit:** r/${escapeMd(sub)}\n` +
     `**Last updated:** ${escapeMd(updated)}\n\n`;
 
-  if (!rows.length) return `${header}_No entries in DB yet._`;
+  if (!rows.length) {
+    let out = `${header}_No entries in DB yet._`;
+    out += buildFooter(cfg);
+    return out;
+  }
 
   const MAX_BODY_CHARS = 39000;
   let out = header + `| Name | Reason |\n|------|--------|\n`;
@@ -513,7 +571,7 @@ function buildMarkdownFromDb(sub: string, title: string, rows: Array<{ u: string
 
   for (const r of rows.slice(0, maxRows)) {
     const line = `| u/${escapeMd(r.u)} | ${escapeMd(r.reason)} |\n`;
-    if (out.length + line.length + 200 > MAX_BODY_CHARS) {
+    if (out.length + line.length + 400 > MAX_BODY_CHARS) {
       truncated = true;
       break;
     }
@@ -522,6 +580,25 @@ function buildMarkdownFromDb(sub: string, title: string, rows: Array<{ u: string
   }
 
   if (truncated) out += `\n_Truncated to ${added} rows due to Reddit post size limits._\n`;
+
+  out += buildFooter(cfg);
+  return out;
+}
+
+function buildFooter(cfg: any): string {
+  console.log('[banlist] footer in:');
+  console.log('[banlist] footer cfg enabled:' + cfg?.footerEnabled);
+  if (!cfg?.footerEnabled) return '';
+
+  let out = `\n---\n`;
+
+  const text = String(cfg.footerText ?? '').trim();
+  if (text) out += `${text}\n`;
+
+  const link = String(cfg.footerLink ?? '').trim();
+  const label = String(cfg.footerLinkLabel ?? 'More info').trim() || 'More info';
+  if (link) out += `\n[${escapeMd(label)}](${link})\n`;
+  console.log('[banlist] footer:' + out);
   return out;
 }
 
@@ -880,20 +957,24 @@ async function runPublish(ctx: Context, actor: DebugSnapshot['actor'], mode: Run
 
   const all = await dbReadAll(ctx);
 
-  const rows = all
+  let rows = all
+
     .map((r) => ({
       u: r.u,
       reason: String(r.reason ?? '').trim() || cfg.defaultLabel || 'Banned',
     }))
     .filter((r) => r.u);
-
+  if (cfg.postOnlyMappedReasons) {
+    const defaultLower = (cfg.defaultLabel ?? 'Banned').toLowerCase().trim();
+    rows = rows.filter(r => r.reason.toLowerCase().trim() !== defaultLower);
+  }
   if (cfg.sortBy === 'reason_asc') rows.sort((a, b) => a.reason.localeCompare(b.reason) || a.u.localeCompare(b.u));
   else rows.sort((a, b) => a.u.localeCompare(b.u));
 
   snap.db.total = rows.length;
   snap.db.sample = rows.slice(0, 10);
 
-  const body = buildMarkdownFromDb(sub, cfg.postTitle, rows, cfg.maxRowsInPost);
+  const body = buildMarkdownFromDb(sub, cfg.postTitle, rows, cfg.maxRowsInPost, cfg);
 
   const stored = await readStoredPostRef(ctx, cfg.postIdKey);
   snap.post.storedPostId = stored?.postId ?? null;
