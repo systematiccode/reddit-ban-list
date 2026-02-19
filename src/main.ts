@@ -582,8 +582,6 @@ function buildMarkdownFromDb(
 }
 
 function buildFooter(cfg: any): string {
-  console.log('[banlist] footer in:');
-  console.log('[banlist] footer cfg enabled:' + cfg?.footerEnabled);
   if (!cfg?.footerEnabled) return '';
 
   let out = `\n---\n`;
@@ -594,7 +592,6 @@ function buildFooter(cfg: any): string {
   const link = String(cfg.footerLink ?? '').trim();
   const label = String(cfg.footerLinkLabel ?? 'More info').trim() || 'More info';
   if (link) out += `\n[${escapeMd(label)}](${link})\n`;
-  console.log('[banlist] footer:' + out);
   return out;
 }
 
@@ -760,7 +757,7 @@ async function fetchLatestBanModlogEntry(
   } catch {
     return null;
   }
-  console.log('[banlist] getModLogs Listing:', JSON.stringify(listing));
+
   const score = (item: any) => {
     const ts =
       Date.parse(String(item?.actionedAt ?? '')) ||
